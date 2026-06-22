@@ -701,6 +701,10 @@ def test_render_transition_rejects_llm_permanent_pitch_shift(pair_with_plan):
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
         patch("app.workers.render_transition.settings.planner_version", "legacy"),
+        # This test exercises the permanent->temporary CONVERSION, which
+        # only exists in "temporary" pitch mode (the default whole_song
+        # mode strips all in-plan pitch tools instead).
+        patch("app.workers.render_transition.settings.pitch_mode", "temporary"),
         patch(
             "app.workers.render_transition.build_pair_plan",
             return_value=_valid_plan(),

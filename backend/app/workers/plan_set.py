@@ -23,10 +23,11 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.db import SessionLocal
-from app.models import Analysis, MixPlan, Queue, Song
+from app.models import Analysis, MixPlan, Queue, QueueItem, Song
 from app.services.llm import get_llm_provider
 from app.services.llm.prompts import SET_PLAN_SYSTEM_PROMPT, set_plan_user_prompt
 from app.services.mixer.decision import TransitionStyle
+from app.services.mixer.pitch_resolver import SongKey, resolve_pitch_offsets
 from app.workers import celery_app
 
 logger = logging.getLogger(__name__)
@@ -41,14 +42,70 @@ def _peak_energy_position(energy_curve: list[float]) -> float | None:
 
 @celery_app.task(name="app.workers.plan_set.plan_set")
 def plan_set(queue_id: str) -> str | None:
-    """Write style_hint onto each of the queue's MixPlan rows."""
+    """Set-level pre-render pass: (1) resolve whole-song pitch offsets,
+    (2) ask the LLM for per-pair style hints. Each half is independently
+    skippable and failure-tolerant — renders proceed regardless."""
+    queue_uuid = uuid.UUID(queue_id)
+
+    if settings.pitch_mode == "whole_song":
+        try:
+            _resolve_queue_pitch_offsets(queue_uuid)
+        except Exception as exc:  # never block the render chord on this
+            logger.error(
+                "plan_set: pitch resolution failed for queue %s: %s",
+                queue_id, exc,
+            )
+
     if not settings.use_llm_planner or settings.planner_version != "v2":
         return None
     try:
-        return _plan_set_inner(uuid.UUID(queue_id))
+        return _plan_set_inner(queue_uuid)
     except Exception as exc:  # never block the render chord on this
         logger.error("plan_set: failed for queue %s: %s", queue_id, exc)
         return None
+
+
+def _resolve_queue_pitch_offsets(queue_uuid: uuid.UUID) -> None:
+    """Deterministic greedy walk over the locked queue; persists one
+    whole-song offset per QueueItem. Runs before any pair render (this
+    task is chained ahead of the render chord), so every render of a
+    song sees the same offset and the stitch junctions line up. Re-runs
+    (e.g. after a re-roll resets the stitch) recompute the same values —
+    keys don't change — so it's naturally idempotent."""
+    with SessionLocal() as db:
+        queue = db.get(Queue, queue_uuid)
+        if queue is None or not queue.locked:
+            return
+        items = sorted(queue.items, key=lambda it: it.position)
+        if len(items) < 2:
+            return
+
+        keys: list[SongKey] = []
+        for item in items:
+            analysis = db.scalar(
+                select(Analysis).where(Analysis.song_id == item.song_id)
+            )
+            if analysis is None:
+                logger.info(
+                    "plan_set: song %s not analyzed; skipping pitch pass",
+                    item.song_id,
+                )
+                return
+            keys.append(SongKey(key=analysis.key, camelot_key=analysis.camelot_key))
+
+        offsets = resolve_pitch_offsets(keys)
+        changed = 0
+        for item, offset in zip(items, offsets):
+            row = db.get(QueueItem, item.id)
+            if row is not None and row.pitch_offset_semitones != offset:
+                row.pitch_offset_semitones = offset
+                changed += 1
+        db.commit()
+        if any(offsets):
+            logger.info(
+                "plan_set: queue %s whole-song pitch offsets %s (%d updated)",
+                queue_uuid, offsets, changed,
+            )
 
 
 def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:

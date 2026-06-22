@@ -51,11 +51,14 @@ from app.services.llm import get_llm_provider
 from app.services.mixer.candidates import enrich_sections, max_seam_time
 from app.services.mixer.executor import render
 from app.services.mixer.plan import build_pair_plan
+from app.services.mixer.pitch_resolver import effective_bundle
 from app.services.mixer.planner_v2 import PlanOutcome, SongMeta, build_plan_v2
+from app.services.mixer.preshift import ensure_pitched_inputs
 from app.services.mixer.types import AnalysisBundle, SongRenderInputs
 from app.services.mixer.validation import (
     enforce_revert_after_crossfade,
     repair_plan,
+    strip_pitch_tools,
     validate_plan,
 )
 from app.services.storage import get_storage
@@ -223,12 +226,21 @@ def render_transition(mix_plan_id: str) -> str | None:
         # set's history in playback order, and the list is part of the LLM
         # cache key — an unordered query would hash differently from run
         # to run and cause spurious cache misses.
-        positions = {
-            it.song_id: it.position
-            for it in db.scalars(
-                select(QueueItem).where(QueueItem.queue_id == row.queue_id)
-            )
+        queue_items = db.scalars(
+            select(QueueItem).where(QueueItem.queue_id == row.queue_id)
+        ).all()
+        positions = {it.song_id: it.position for it in queue_items}
+        # Whole-song pitch offsets resolved by the set-level pass (0 in
+        # "temporary"/"off" modes or before the pass has run).
+        pitch_offsets = {
+            it.song_id: (it.pitch_offset_semitones or 0) for it in queue_items
         }
+        a_pitch_offset = pitch_offsets.get(a.id, 0)
+        b_pitch_offset = pitch_offsets.get(b.id, 0)
+        # Plain-string snapshots for use after the session closes
+        # (detached ORM attributes can expire on commit).
+        a_song_id = str(a.id)
+        b_song_id = str(b.id)
         siblings = sorted(
             db.scalars(
                 select(MixPlan).where(
@@ -267,9 +279,12 @@ def render_transition(mix_plan_id: str) -> str | None:
         )
 
     async def _build_plan() -> PlanOutcome:
+        a_eff = effective_bundle(a_bundle, a_pitch_offset)
+        b_eff = effective_bundle(b_bundle, b_pitch_offset)
+
         if not settings.use_llm_planner:
             return PlanOutcome(
-                plan=build_pair_plan(a_bundle, b_bundle),
+                plan=build_pair_plan(a_eff, b_eff),
                 source="deterministic", style=None, rationale=None,
             )
 
@@ -284,25 +299,29 @@ def render_transition(mix_plan_id: str) -> str | None:
         if settings.planner_version == "v2":
             return await build_plan_v2(
                 provider,
-                SongMeta(a_title, a_artist, a_bundle, a_energy_curve, a_regions),
-                SongMeta(b_title, b_artist, b_bundle, b_energy_curve, b_regions),
+                SongMeta(a_title, a_artist, a_bundle, a_energy_curve,
+                         a_regions, pitch_offset=a_pitch_offset),
+                SongMeta(b_title, b_artist, b_bundle, b_energy_curve,
+                         b_regions, pitch_offset=b_pitch_offset),
                 style_hint=style_hint,
                 style_override=style_override,
                 previous_styles=previous_styles,
                 pair_label=pair_label,
                 nonce=reroll_nonce,
+                pitch_mode=settings.pitch_mode,
+                loudness_match=settings.loudness_match,
             )
 
         # ---- legacy free-form path, with repair-not-reject ----
         a_llm_input = {
             "analysis": _bundle_to_legacy_llm_dict(
-                a_bundle, a_energy_curve, a_title, a_artist
+                a_eff, a_energy_curve, a_title, a_artist
             ),
             "vocal_safe_regions": a_regions,
         }
         b_llm_input = {
             "analysis": _bundle_to_legacy_llm_dict(
-                b_bundle, b_energy_curve, b_title, b_artist
+                b_eff, b_energy_curve, b_title, b_artist
             ),
             "vocal_safe_regions": b_regions,
         }
@@ -310,7 +329,7 @@ def render_transition(mix_plan_id: str) -> str | None:
             plan = await provider.plan_transition(
                 a_llm_input, b_llm_input, _LEGACY_TOOLS_SCHEMA
             )
-            repaired = repair_plan(plan, a_bundle, b_bundle)
+            repaired = repair_plan(plan, a_eff, b_eff)
             validate_plan(repaired)
             source = "llm_legacy" if repaired == plan else "llm_legacy_repaired"
             return PlanOutcome(plan=repaired, source=source, style=None, rationale=None)
@@ -320,7 +339,7 @@ def render_transition(mix_plan_id: str) -> str | None:
                 "to deterministic: %s", exc,
             )
             return PlanOutcome(
-                plan=build_pair_plan(a_bundle, b_bundle),
+                plan=build_pair_plan(a_eff, b_eff),
                 source="deterministic_fallback", style=None, rationale=None,
             )
 
@@ -335,9 +354,18 @@ def render_transition(mix_plan_id: str) -> str | None:
             mix_plan_id, outcome.source, outcome.style,
         )
 
+    # Outside "temporary" mode no plan may carry pitch tools: whole-song
+    # mode pre-shifts the audio itself (a leftover tool would double-
+    # shift) and "off" mode accepts clashes (a leftover tool would
+    # glide). Covers legacy-prompt output, deterministic fallbacks on a
+    # clash, and cached pre-migration plans alike.
+    plan_for_render = outcome.plan
+    if settings.pitch_mode != "temporary":
+        plan_for_render = strip_pitch_tools(plan_for_render)
+
     # Guarantee B's tempo/pitch revert only fires once the crossfade is
     # done, whatever the source of the plan (fresh, cached, or fallback).
-    plan_json = enforce_revert_after_crossfade(outcome.plan, b_bundle)
+    plan_json = enforce_revert_after_crossfade(plan_for_render, b_bundle)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -366,6 +394,20 @@ def render_transition(mix_plan_id: str) -> str | None:
             )
 
         a_paths, b_paths, a_orig, b_orig = asyncio.run(_download_inputs())
+
+        # Whole-song pitch: mutate the local copies so the executor (and
+        # therefore BOTH renders that touch each song) sees the shifted
+        # audio. Cached in storage per (song, offset) — the second render
+        # sharing a song downloads instead of re-shifting.
+        if settings.pitch_mode == "whole_song" and (a_pitch_offset or b_pitch_offset):
+            async def _preshift_all():
+                await ensure_pitched_inputs(
+                    storage, a_song_id, a_pitch_offset, a_paths, a_orig
+                )
+                await ensure_pitched_inputs(
+                    storage, b_song_id, b_pitch_offset, b_paths, b_orig
+                )
+            asyncio.run(_preshift_all())
 
         a_inputs = SongRenderInputs(
             stem_paths=a_paths, analysis=a_bundle, original_audio_path=a_orig
