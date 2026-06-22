@@ -57,5 +57,14 @@ class QueueItem(Base):
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
 
+    # Whole-song semitone offset assigned by the set-level pitch resolver
+    # (pitch_mode="whole_song"): this song plays shifted by this many
+    # semitones for its ENTIRE duration in this queue's mix, eliminating
+    # mid-song key glides. 0 = native key. Queue-scoped on purpose — the
+    # same song can need different offsets next to different neighbors.
+    pitch_offset_semitones: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+
     queue: Mapped["Queue"] = relationship("Queue", back_populates="items")
     song: Mapped["Song"] = relationship("Song", lazy="joined")

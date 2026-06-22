@@ -14,6 +14,7 @@ class QueueItemRead(BaseModel):
     id: uuid.UUID
     queue_id: uuid.UUID
     position: int
+    pitch_offset_semitones: int = 0
     song: SongRead
 
 

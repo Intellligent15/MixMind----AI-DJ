@@ -58,6 +58,22 @@ class Settings(BaseSettings):
     # otherwise. See app/services/analysis/sections/allin1_detector.py.
     section_detector: str = "librosa_laplacian"  # librosa_laplacian | allin1
 
+    # How key clashes between adjacent songs are handled:
+    # - "whole_song" (default): a set-level resolver assigns each song a
+    #   constant semitone offset (capped at ±2) applied to its ENTIRE
+    #   play, so there is never an audible mid-song key glide. Clashes
+    #   beyond the cap are accepted and masked by transition style.
+    # - "temporary": the v1 behavior — B is held in A's key during the
+    #   crossfade then glided back to native afterwards (audible).
+    # - "off": never pitch-shift; clashes are masked by style choice only.
+    pitch_mode: str = "whole_song"  # whole_song | temporary | off
+
+    # Seam loudness matching: align the incoming song's perceived level
+    # to the outgoing one at the seam (no energy pothole/spike), then
+    # glide back to its native level after the crossfade. Boost capped
+    # at +4 dB, cut at -6 dB; gaps under ~1.25 dB are left alone.
+    loudness_match: bool = True
+
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
     # Required on cloud hosts (the droplet) — YouTube's anti-bot system
     # rejects datacenter IPs unless an authenticated session is presented.
