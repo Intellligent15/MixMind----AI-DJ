@@ -137,6 +137,10 @@ export type QueueItem = {
   id: string;
   queue_id: string;
   position: number;
+  // Whole-song semitone offset (pitch_mode="whole_song"): this song
+  // plays shifted by this many semitones for its entire duration in
+  // this queue's mix. 0 = native key.
+  pitch_offset_semitones: number;
   song: Song;
 };
 

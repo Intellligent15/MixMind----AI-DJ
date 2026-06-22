@@ -34,15 +34,22 @@ function prettyStyle(id: string | null): string {
   return id.replaceAll("_", " ");
 }
 
+function pitchBadge(offset: number): string {
+  const sign = offset > 0 ? "+" : "\u2212";
+  return `${sign}${Math.abs(offset)} st`;
+}
+
 function TransitionRow({
   plan,
   fromTitle,
   toTitle,
+  toPitchOffset,
   styles,
 }: {
   plan: MixPlan;
   fromTitle: string;
   toTitle: string;
+  toPitchOffset: number;
   styles: TransitionStyleInfo[];
 }) {
   const queryClient = useQueryClient();
@@ -55,7 +62,11 @@ function TransitionRow({
       api.rerollMixPlan(plan.id, pendingStyle === "auto" ? undefined : pendingStyle),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["mix-plans", plan.queue_id] });
-      queryClient.invalidateQueries({ queryKey: ["queue-render"] });
+      // The Player's stitched-mix query lives under ["mix", queueId].
+      // Invalidating it makes the Player refetch immediately, see the
+      // reset (pending) status, and resume its 1s polling until the
+      // re-stitched mix is ready — no page reload needed.
+      queryClient.invalidateQueries({ queryKey: ["mix", plan.queue_id] });
     },
   });
 
@@ -82,6 +93,14 @@ function TransitionRow({
         )}
         {plan.style_override && (
           <span className="text-sky-400">pinned: {prettyStyle(plan.style_override)}</span>
+        )}
+        {toPitchOffset !== 0 && (
+          <span
+            className="px-2 py-0.5 rounded bg-violet-900/60 text-violet-200"
+            title={`The incoming song plays ${pitchBadge(toPitchOffset)} for its entire duration so its key blends with the previous track \u2014 no mid-song key glide.`}
+          >
+            in: {pitchBadge(toPitchOffset)}
+          </span>
         )}
       </div>
 
@@ -162,6 +181,9 @@ export function TransitionControls() {
   const titleBySong = new Map(
     queue.items.map((it) => [it.song.id, it.song.title])
   );
+  const pitchBySong = new Map(
+    queue.items.map((it) => [it.song.id, it.pitch_offset_semitones ?? 0])
+  );
 
   return (
     <section className="flex flex-col gap-3">
@@ -175,6 +197,7 @@ export function TransitionControls() {
             plan={plan}
             fromTitle={titleBySong.get(plan.from_song_id) ?? "?"}
             toTitle={titleBySong.get(plan.to_song_id) ?? "?"}
+            toPitchOffset={pitchBySong.get(plan.to_song_id) ?? 0}
             styles={stylesQuery.data ?? []}
           />
         ))}

@@ -119,6 +119,10 @@ export function Player() {
   const [playMode, setPlayMode] = useState<"mix" | "queue">("mix");
   const isMixReady = mixData?.status === "ready";
   const activeMode = isMixReady ? playMode : "queue";
+  // Only meaningful in mix mode; null otherwise so status churn during a
+  // re-render can't restart per-song playback.
+  const mixAudioVersion =
+    activeMode === "mix" ? mixData?.updated_at ?? null : null;
 
   const songById = useMemo(
     () => Object.fromEntries(songs.map((s) => [s.id, s])),
@@ -249,8 +253,12 @@ export function Player() {
     setPosition(0);
     setDuration(0);
 
+    // Version the mix URL with the render row's updated_at: a re-stitch
+    // writes a new timestamp, producing a NEW url — so the browser can't
+    // serve the previous mix from its HTTP cache, and this effect re-runs
+    // (mixAudioVersion is a dependency) to load the fresh audio.
     const audioUrl = activeMode === "mix" && queueQuery.data
-      ? api.queueMixAudioUrl(queueQuery.data.id)
+      ? `${api.queueMixAudioUrl(queueQuery.data.id)}?v=${encodeURIComponent(mixAudioVersion ?? "")}`
       : api.audioUrl(current!.id);
 
     let isCancelled = false;
@@ -304,7 +312,7 @@ export function Player() {
       wsRef.current = null;
       regionsPluginRef.current = null;
     };
-  }, [currentIdx, current?.id, currentPlayable, activeMode, queueQuery.data?.id]);
+  }, [currentIdx, current?.id, currentPlayable, activeMode, queueQuery.data?.id, mixAudioVersion]);
 
   const plotRegions = useCallback(() => {
     const regionsPlugin = regionsPluginRef.current;
