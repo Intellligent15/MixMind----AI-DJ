@@ -321,3 +321,19 @@ def enforce_revert_after_crossfade(
                 call = {**call, "start_time": crossfade_end_b}
         out.append(call)
     return out
+
+
+def strip_pitch_tools(plan: list[dict]) -> list[dict]:
+    """Remove every in-plan pitch tool (permanent AND temporary).
+
+    Applied by the worker whenever settings.pitch_mode != "temporary":
+    under whole-song mode the audio is pre-shifted before rendering and
+    under "off" mode clashes are accepted, so any pitch call left in a
+    plan (legacy prompt output, deterministic fallback on a clash, or a
+    cached pre-migration plan) would double-shift or glide. Tempo ramps
+    are untouched — they don't change key.
+    """
+    return [
+        c for c in plan
+        if c.get("tool") not in ("pitch_shift", "temporary_pitch_shift")
+    ]

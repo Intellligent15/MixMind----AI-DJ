@@ -65,12 +65,14 @@ HOW TO CHOOSE:
 1. Energy first. Blend A's tail into B's first rise, or drop B's high-energy entry where A has gone quiet. Use the candidates' energy values and descriptions.
 2. Then character. Two drum-driven dance tracks → drum_bridge or drop_swap. A hot track into a mellow one → wash_out. A big genre/tempo jump → vinyl_stop. Similar vibes → smooth_blend with a short a_fade_out_bars.
 3. drop_swap and stutter_buildup need the relevant candidate to be vocal_safe (true) — never pick them otherwise.
+3b. acapella_out and acapella_in layer one song's vocals over the other's instrumental — the ultimate crowd move when one track has an iconic vocal. They REQUIRE the key_verdict to be "compatible" (never pick them on a clash), and acapella_in additionally wants a vocal_safe OUT point on A. Use them when you KNOW the songs: a famous hook riding a new beat. Extras behave differently here: the riding vocal is kept CLEAN and DRY; "reverb_tail"/"echo_tail" apply only to the vocal's exit moment (a tasteful trail as it hands over), and "bass_kill"/"filter_sweep_out" are ignored. Most acapella transitions need no extras at all.
 4. Vary the set. You are told which styles previous pairs used and may get a suggested style from the set planner. Treat the suggestion as a strong default; deviate only when the songs clearly demand it.
 
 EXAMPLES (shape only — choose ids/styles that fit YOUR songs):
 {{"out": "A2", "in": "B2", "style": "drop_swap", "duration_bars": 2, "extras": ["echo_tail"], "rationale": "Both are big-room house and B2 is the drop — snap straight into it while A echoes out."}}
 {{"out": "A1", "in": "B1", "style": "wash_out", "duration_bars": 12, "a_fade_out_bars": 6, "rationale": "A ends hot and B opens ambient; washing A's chorus into reverb lets B's pads surface cleanly."}}
 {{"out": "A3", "in": "B1", "style": "drum_bridge", "duration_bars": 16, "a_fade_out_bars": 8, "rationale": "Both grooves are percussion-led at similar energy; bridging the drums keeps the floor moving."}}
+{{"out": "A1", "in": "B2", "style": "acapella_out", "duration_bars": 12, "rationale": "A's chorus vocal is iconic and the keys are compatible — ride that vocal over B's groove, then hand off to B's verse."}}
 
 Output ONLY the JSON object. No prose outside it.
 """
@@ -82,7 +84,7 @@ INPUT: an ordered list of songs, each with index, title, artist, bpm, key, camel
 
 YOUR JOB: assign each ADJACENT PAIR a suggested transition style so the set flows — build energy where it should build, breathe where it should breathe, and never repeat the same trick back-to-back unless the music demands it.
 
-Styles: smooth_blend (classic blend), drop_swap (snap into B's drop — high energy), drum_bridge (drums bridge two grooves), wash_out (A dissolves, B surfaces — energy release or genre jump), stutter_buildup (tension stutter then drop), vinyl_stop (full stop then restart — theatrical, big tempo/vibe jumps only, at most once per set).
+Styles: smooth_blend (classic blend), drop_swap (snap into B's drop — high energy), drum_bridge (drums bridge two grooves), wash_out (A dissolves, B surfaces — energy release or genre jump), stutter_buildup (tension stutter then drop), vinyl_stop (full stop then restart — theatrical, big tempo/vibe jumps only, at most once per set), acapella_out (A's vocal rides over B's new beat — iconic-vocal tracks, compatible keys only), acapella_in (B's vocal teases over A's beat before the swap — compatible keys only).
 
 Return ONLY this JSON object:
 {

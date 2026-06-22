@@ -45,10 +45,15 @@ from app.services.mixer.executor import (
     _norm_corr,
     render,
 )
+from app.services.mixer.pitch_resolver import SongKey, resolve_pitch_offsets
 from app.services.mixer.plan import build_pair_plan
 from app.services.mixer.planner_v2 import SongMeta, build_plan_v2
+from app.services.mixer.preshift import ensure_pitched_inputs
 from app.services.mixer.types import AnalysisBundle, SongRenderInputs
-from app.services.mixer.validation import enforce_revert_after_crossfade
+from app.services.mixer.validation import (
+    enforce_revert_after_crossfade,
+    strip_pitch_tools,
+)
 from app.services.storage import get_storage
 from app.services.vocal_safety.safety import vocal_safe_regions
 from app.workers.render_transition import _to_bundle
@@ -143,7 +148,8 @@ async def _load_song(db, song_id: uuid.UUID, storage, tmp: Path, prefix: str):
 
 
 async def _eval_pair(from_id: uuid.UUID, to_id: uuid.UUID,
-                     style: str | None, nonce: int) -> None:
+                     style: str | None, nonce: int,
+                     pitch_mode: str) -> None:
     storage = get_storage()
     out_dir = Path(settings.local_storage_path) / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -154,7 +160,28 @@ async def _eval_pair(from_id: uuid.UUID, to_id: uuid.UUID,
         b_meta, b_inputs = await _load_song(db, to_id, storage, tmp, "b")
 
         pair_tag = f"{str(from_id)[:8]}__{str(to_id)[:8]}"
-        print(f"\n=== {a_meta.title} → {b_meta.title} ===")
+        print(f"\n=== {a_meta.title} → {b_meta.title} (pitch_mode={pitch_mode}) ===")
+
+        # Whole-song mode: resolve the pair's offsets exactly like the
+        # set-level pass would (A is the walk's first song → always 0),
+        # pre-shift the local copies, and carry the offsets into planning.
+        if pitch_mode == "whole_song":
+            offsets = resolve_pitch_offsets([
+                SongKey(a_meta.bundle.key, a_meta.bundle.camelot_key),
+                SongKey(b_meta.bundle.key, b_meta.bundle.camelot_key),
+            ])
+            print(f"  whole-song offsets: A {offsets[0]:+d} st, B {offsets[1]:+d} st")
+            await ensure_pitched_inputs(
+                storage, str(from_id), offsets[0], a_inputs.stem_paths,
+                a_inputs.original_audio_path,
+            )
+            await ensure_pitched_inputs(
+                storage, str(to_id), offsets[1], b_inputs.stem_paths,
+                b_inputs.original_audio_path,
+            )
+            from dataclasses import replace as _dc_replace
+            a_meta = _dc_replace(a_meta, pitch_offset=offsets[0])
+            b_meta = _dc_replace(b_meta, pitch_offset=offsets[1])
 
         # (a) deterministic v1
         det_plan = enforce_revert_after_crossfade(
@@ -170,9 +197,12 @@ async def _eval_pair(from_id: uuid.UUID, to_id: uuid.UUID,
         # (b) planner v2
         outcome = await build_plan_v2(
             get_llm_provider(), a_meta, b_meta,
-            style_override=style, nonce=nonce,
+            style_override=style, nonce=nonce, pitch_mode=pitch_mode,
         )
-        v2_plan = enforce_revert_after_crossfade(outcome.plan, b_meta.bundle)
+        v2_plan = outcome.plan
+        if pitch_mode != "temporary":
+            v2_plan = strip_pitch_tools(v2_plan)
+        v2_plan = enforce_revert_after_crossfade(v2_plan, b_meta.bundle)
         v2 = render(v2_plan, a_inputs, b_inputs)
         v2_path = out_dir / f"{pair_tag}__v2_{outcome.style or 'fallback'}.wav"
         v2_path.write_bytes(v2.wav_bytes)
@@ -193,6 +223,10 @@ def main() -> None:
                         help="pin a transition style for the v2 render")
     parser.add_argument("--nonce", type=int, default=0,
                         help="re-roll nonce (busts the LLM cache)")
+    parser.add_argument("--pitch-mode", default=settings.pitch_mode,
+                        choices=("whole_song", "temporary", "off"),
+                        help="key-clash handling for the v2 render "
+                             "(deterministic baseline always renders native)")
     args = parser.parse_args()
 
     pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
@@ -211,7 +245,7 @@ def main() -> None:
         raise SystemExit("provide --from/--to or --queue")
 
     for f, t in pairs:
-        asyncio.run(_eval_pair(f, t, args.style, args.nonce))
+        asyncio.run(_eval_pair(f, t, args.style, args.nonce, args.pitch_mode))
 
 
 if __name__ == "__main__":

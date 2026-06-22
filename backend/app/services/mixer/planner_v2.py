@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from app.services.mixer.archetypes import (
+    ACAPELLA_STYLES,
     ArchetypeError,
     camelot_compatible,
     default_decision,
@@ -36,6 +37,7 @@ from app.services.mixer.candidates import (
     enrich_sections,
 )
 from app.services.mixer.decision import TransitionDecision, TransitionStyle
+from app.services.mixer.pitch_resolver import effective_bundle
 from app.services.mixer.plan import build_pair_plan, compute_pitch_shift
 from app.services.mixer.types import AnalysisBundle, MixPlanJSON
 
@@ -51,6 +53,11 @@ class SongMeta:
     bundle: AnalysisBundle
     energy_curve: list[float]
     safe_regions: list[dict]
+    # Whole-song semitone offset assigned by the set-level pitch
+    # resolver (0 unless settings.pitch_mode == "whole_song"). The
+    # planner reasons about EFFECTIVE keys (native + offset); the worker
+    # pre-shifts the audio to match.
+    pitch_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,7 +69,7 @@ class PlanOutcome:
 
 
 def _song_llm_input(meta: SongMeta, candidates: list) -> dict:
-    b = meta.bundle
+    b = effective_bundle(meta.bundle, meta.pitch_offset)
     return {
         "title": meta.title,
         "artist": meta.artist,
@@ -75,14 +82,16 @@ def _song_llm_input(meta: SongMeta, candidates: list) -> dict:
     }
 
 
-def _pair_facts(a: AnalysisBundle, b: AnalysisBundle) -> dict:
+def _pair_facts(
+    a: AnalysisBundle, b: AnalysisBundle, pitch_mode: str = "temporary"
+) -> dict:
     tempo_gap_pct = (
         round(abs(a.bpm - b.bpm) / a.bpm * 100.0, 1) if a.bpm and b.bpm else None
     )
     compatible = camelot_compatible(a.camelot_key, b.camelot_key)
     if compatible:
         key_verdict = "compatible — no pitch handling needed"
-    else:
+    elif pitch_mode == "temporary":
         try:
             delta = compute_pitch_shift(a.key, b.key)
         except ValueError:
@@ -90,6 +99,15 @@ def _pair_facts(a: AnalysisBundle, b: AnalysisBundle) -> dict:
         key_verdict = (
             f"clash — B will be held {delta:+d} semitones in A's key during "
             f"the blend, automatically"
+        )
+    else:
+        # whole_song mode with a remaining clash (resolver gave up: the
+        # needed shift exceeded the artifact cap), or pitch_mode "off".
+        # Route the model toward styles where the keys barely overlap.
+        key_verdict = (
+            "clash — keys cannot be matched; strongly prefer a short or "
+            "washy transition (drop_swap, wash_out, vinyl_stop, or a short "
+            "stutter_buildup) and avoid long melodic blends"
         )
     return {
         "tempo_gap_percent": tempo_gap_pct,
@@ -150,6 +168,8 @@ async def build_plan_v2(
     previous_styles: list[str] | None = None,
     pair_label: str | None = None,
     nonce: int = 0,
+    pitch_mode: str = "temporary",
+    loudness_match: bool = True,
 ) -> PlanOutcome:
     # Lazy import keeps the mixer package importable without the llm
     # package's heavy provider dependencies (pure unit tests, tooling).
@@ -157,6 +177,12 @@ async def build_plan_v2(
         DECISION_SYSTEM_PROMPT,
         decision_user_prompt,
     )
+
+    # EFFECTIVE bundles fold each song's whole-song offset into its
+    # key/camelot — all key reasoning below (pair facts, archetype pitch
+    # logic, deterministic fallback) sees the keys the listener will hear.
+    a_eff = effective_bundle(a.bundle, a.pitch_offset)
+    b_eff = effective_bundle(b.bundle, b.pitch_offset)
 
     candidates = build_pair_candidates(
         a.bundle, b.bundle,
@@ -176,7 +202,7 @@ async def build_plan_v2(
             "planner_v2: no usable seam candidates; deterministic fallback"
         )
         return PlanOutcome(
-            plan=build_pair_plan(a.bundle, b.bundle),
+            plan=build_pair_plan(a_eff, b_eff),
             source="deterministic_fallback",
             style=None,
             rationale="songs too short for candidate generation",
@@ -200,7 +226,7 @@ async def build_plan_v2(
     user = decision_user_prompt(
         _song_llm_input(a, candidates.out_candidates),
         _song_llm_input(b, candidates.in_candidates),
-        _pair_facts(a.bundle, b.bundle),
+        _pair_facts(a_eff, b_eff, pitch_mode),
         context or None,
     )
 
@@ -226,9 +252,34 @@ async def build_plan_v2(
                 update={"duration_bars": decision.normalized_duration()}
             )
 
+    # Acapella styles layer one song's VOCALS over the other's
+    # instrumental — the single most key-exposed move in the toolkit. If
+    # the model picked one on a pair whose effective keys still clash
+    # (resolver hit the artifact cap), downgrade to a smooth blend. A
+    # user pin is honored as-is: their call.
+    if (
+        decision is not None
+        and pinned_style is None
+        and decision.style in ACAPELLA_STYLES
+        and not camelot_compatible(a_eff.camelot_key, b_eff.camelot_key)
+    ):
+        logger.info(
+            "planner_v2: %s chosen on a key clash; downgrading to smooth_blend",
+            decision.style.value,
+        )
+        decision = decision.model_copy(update={"style": TransitionStyle.smooth_blend})
+        decision = decision.model_copy(
+            update={"duration_bars": decision.normalized_duration()}
+        )
+
     if decision is not None:
         try:
-            plan = expand(decision, a.bundle, b.bundle, candidates)
+            plan = expand(
+                decision, a_eff, b_eff, candidates, pitch_mode,
+                a_safe_regions=a.safe_regions, b_safe_regions=b.safe_regions,
+                a_energy_curve=a.energy_curve, b_energy_curve=b.energy_curve,
+                loudness_match=loudness_match,
+            )
             return PlanOutcome(
                 plan=plan, source=source,
                 style=decision.style.value,
@@ -241,7 +292,12 @@ async def build_plan_v2(
     # deterministically; otherwise fall back to the v1 planner.
     try:
         fallback = default_decision(candidates, style=pinned_style)
-        plan = expand(fallback, a.bundle, b.bundle, candidates)
+        plan = expand(
+            fallback, a_eff, b_eff, candidates, pitch_mode,
+            a_safe_regions=a.safe_regions, b_safe_regions=b.safe_regions,
+            a_energy_curve=a.energy_curve, b_energy_curve=b.energy_curve,
+            loudness_match=loudness_match,
+        )
         return PlanOutcome(
             plan=plan, source="style_default",
             style=fallback.style.value, rationale=fallback.rationale,
@@ -249,7 +305,7 @@ async def build_plan_v2(
     except ArchetypeError as exc:
         logger.error("planner_v2: default expansion failed (%s)", exc)
         return PlanOutcome(
-            plan=build_pair_plan(a.bundle, b.bundle),
+            plan=build_pair_plan(a_eff, b_eff),
             source="deterministic_fallback",
             style=None, rationale=None,
         )

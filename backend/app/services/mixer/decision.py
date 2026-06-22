@@ -28,6 +28,8 @@ class TransitionStyle(str, enum.Enum):
     wash_out = "wash_out"
     stutter_buildup = "stutter_buildup"
     vinyl_stop = "vinyl_stop"
+    acapella_out = "acapella_out"
+    acapella_in = "acapella_in"
 
 
 class TransitionExtra(str, enum.Enum):
@@ -48,6 +50,8 @@ STYLE_DURATION_CHOICES: dict[TransitionStyle, tuple[int, ...]] = {
     TransitionStyle.wash_out: (8, 12, 16),
     TransitionStyle.stutter_buildup: (4, 8),
     TransitionStyle.vinyl_stop: (2, 4),
+    TransitionStyle.acapella_out: (8, 12, 16),
+    TransitionStyle.acapella_in: (8, 12, 16),
 }
 
 STYLE_DESCRIPTIONS: dict[TransitionStyle, str] = {
@@ -76,6 +80,18 @@ STYLE_DESCRIPTIONS: dict[TransitionStyle, str] = {
         "A grinds to a halt like a turntable being stopped, then B starts "
         "fresh. The escape hatch for incompatible tempos or total vibe "
         "changes — use sparingly, it's theatrical."
+    ),
+    TransitionStyle.acapella_out: (
+        "B's instrumental takes over fast at the seam while A's VOCALS keep "
+        "riding on top of B's new beat, then hand over to B's vocals at a "
+        "phrase boundary. Spine-tingling when A has an iconic vocal and B "
+        "is groove-led. REQUIRES compatible keys — never pick on a clash."
+    ),
+    TransitionStyle.acapella_in: (
+        "B's VOCALS arrive immediately over A's still-playing backing track "
+        "(a teaser), then A's instrumental swaps to B's later. Great when "
+        "B's hook is instantly recognizable. REQUIRES compatible keys — "
+        "never pick on a clash — and a vocal-safe OUT point on A."
     ),
 }
 
