@@ -19,7 +19,7 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 echo "==> Starting Docker services (postgres, redis, backend, frontend)..."
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
 echo "==> Waiting for postgres + redis to be healthy..."
 for i in {1..30}; do

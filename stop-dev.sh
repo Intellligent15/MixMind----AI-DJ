@@ -8,3 +8,7 @@ cd "$REPO_ROOT"
 echo "==> Stopping Docker services..."
 docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 echo "    Done. (Postgres volume preserved. Use 'docker compose down -v' to wipe it.)"
+
+echo "==> Pruning dangling images and build cache to save disk space..."
+docker image prune -f >/dev/null || true
+docker builder prune -f >/dev/null || true
