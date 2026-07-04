@@ -74,7 +74,7 @@ services:
     profiles: ["prod"]
     build:
       context: ./backend
-    command: ["celery", "-A", "app.workers", "worker", "--loglevel=INFO", "--pool=solo"]
+    command: ["celery", "-A", "app.workers", "worker", "--loglevel=INFO", "--pool=threads", "--concurrency=8"]
     env_file: ./backend/.env
     environment:
       DATABASE_URL: postgresql+psycopg://aidj:aidj@postgres:5432/aidj

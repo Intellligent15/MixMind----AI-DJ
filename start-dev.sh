@@ -73,4 +73,4 @@ echo
 # Bump --concurrency higher only if you want more songs in-flight than
 # Modal's free tier wants to spin up at once (each parallel separation
 # is its own GPU container).
-exec uv run --group worker celery -A app.workers worker --loglevel=info --pool=threads --concurrency=4
+exec uv run --group worker celery -A app.workers worker --loglevel=info --pool=threads --concurrency=8
