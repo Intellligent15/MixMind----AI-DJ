@@ -345,7 +345,7 @@ export function DownloadedSongs() {
                   disabled={deleteSong.isPending}
                   className="text-sm opacity-50 hover:opacity-100 hover:text-red-500 px-2 disabled:opacity-30"
                 >
-                  ✕
+                  ×
                 </button>
               </div>
               {(s.status === "downloaded" ||

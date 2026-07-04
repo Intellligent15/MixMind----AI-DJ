@@ -165,6 +165,107 @@ export function Player() {
     );
   }, [activeMode, timeline, position]);
 
+  // Feedback window: the most recent transition that has started stays
+  // votable for 30 s after it ends — and the FINAL transition stays
+  // votable through the outro and after the mix finishes, since there's
+  // nothing after it to confuse the vote with (and the mix often ends
+  // before a 30 s window would).
+  const feedbackTransition = useMemo(() => {
+    if (activeMode !== "mix" || !timeline?.transitions.length) return null;
+    let recent = null;
+    for (const t of timeline.transitions) {
+      if (t.start <= position) recent = t;
+      else break;
+    }
+    if (!recent) return null;
+    const last = timeline.transitions[timeline.transitions.length - 1];
+    if (position < recent.end + 30 || recent.index === last.index) {
+      return recent;
+    }
+    return null;
+  }, [activeMode, timeline, position]);
+  const [votedTransitions, setVotedTransitions] = useState<
+    Record<number, "thumbs_up" | "thumbs_down">
+  >({});
+  const voteOnTransition = useCallback(
+    (kind: "thumbs_up" | "thumbs_down") => {
+      const qid = queueQuery.data?.id;
+      const t = feedbackTransition;
+      if (!qid || !t) return;
+      setVotedTransitions((prev) => ({ ...prev, [t.index]: kind }));
+      api
+        .sendTransitionFeedback(qid, t.from_song_id, t.to_song_id, kind)
+        .catch(() => {
+          // Feedback is best-effort; never interrupt playback over it.
+        });
+    },
+    [queueQuery.data?.id, feedbackTransition]
+  );
+  // Large forward seeks in mix mode count as skips — attributed
+  // server-side to the transition the listener jumped away from.
+  const lastPositionRef = useRef(0);
+  useEffect(() => {
+    lastPositionRef.current = position;
+  }, [position]);
+
+  // Live energy dial: bend the not-yet-played remainder of the set.
+  const [dialNotice, setDialNotice] = useState<string | null>(null);
+  const energyDial = useCallback(
+    (direction: "up" | "hold" | "down") => {
+      const qid = queueQuery.data?.id;
+      if (!qid) return;
+      api
+        .setEnergyDial(qid, direction, lastPositionRef.current)
+        .then((res) => {
+          const n = res.affected_transitions.length;
+          setDialNotice(
+            n === 0
+              ? "Nothing far enough ahead to change — try the skip button"
+              : `Re-reading the room… ${n} transition${n === 1 ? "" : "s"} updating`
+          );
+          setTimeout(() => setDialNotice(null), 6000);
+        })
+        .catch((err) =>
+          setDialNotice((err as Error).message ?? "energy dial failed")
+        );
+    },
+    [queueQuery.data?.id]
+  );
+
+  // Instant skip: jump the playhead to just before the next transition
+  // (and let the feedback loop know this stretch got skipped).
+  const nextTransition = useMemo(() => {
+    if (activeMode !== "mix" || !timeline) return null;
+    return timeline.transitions.find((t) => t.start > position + 2) ?? null;
+  }, [activeMode, timeline, position]);
+  const skipToNextTransition = useCallback(() => {
+    const ws = wsRef.current;
+    const qid = queueQuery.data?.id;
+    if (!ws || !nextTransition) return;
+    if (qid) {
+      api.sendPlaybackEvent(qid, "skip", lastPositionRef.current).catch(() => {});
+    }
+    ws.setTime(Math.max(0, nextTransition.start - 2));
+  }, [nextTransition, queueQuery.data?.id]);
+
+  // Hot-swap: when the mix re-renders mid-listen (energy dial / reroll),
+  // the wavesurfer effect below recreates the player with the new file —
+  // capture the playhead so "ready" can restore it. Content before the
+  // first changed transition is time-identical, so the position maps 1:1.
+  const resumePositionRef = useRef<number | null>(null);
+  const prevMixKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = activeMode === "mix" ? mixAudioVersion : null;
+    if (
+      prevMixKeyRef.current !== null &&
+      key !== null &&
+      key !== prevMixKeyRef.current
+    ) {
+      resumePositionRef.current = lastPositionRef.current;
+    }
+    prevMixKeyRef.current = key;
+  }, [activeMode, mixAudioVersion]);
+
   // Auto-stitch backstop. The backend fires the eager stitch when the queue
   // finishes processing, so the mix row normally already exists by the time
   // the player mounts. This covers the gaps: no row at all, or a prior
@@ -286,6 +387,13 @@ export function Player() {
 
       ws.on("ready", () => {
         setDuration(ws.getDuration());
+        // Restore the playhead after a mid-listen mix re-render (energy
+        // dial / reroll hot-swap). One-shot.
+        const resume = resumePositionRef.current;
+        resumePositionRef.current = null;
+        if (resume != null && resume > 1 && resume < ws.getDuration() - 1) {
+          ws.setTime(resume);
+        }
         ws.play().then(
           () => setAutoplayBlocked(false),
           () => setAutoplayBlocked(true),
@@ -297,6 +405,14 @@ export function Player() {
       });
       ws.on("pause", () => setIsPlaying(false));
       ws.on("timeupdate", (t: number) => setPosition(t));
+      ws.on("interaction", (newTime: number) => {
+        // A big forward jump in mix mode reads as "get me out of here".
+        const from = lastPositionRef.current;
+        const qid = queueQuery.data?.id;
+        if (activeMode === "mix" && qid && newTime > from + 20) {
+          api.sendPlaybackEvent(qid, "skip", from).catch(() => {});
+        }
+      });
       ws.on("finish", () => {
         if (activeMode !== "mix") advanceRef.current();
       });
@@ -408,7 +524,7 @@ export function Player() {
         <section className="border rounded p-4 flex gap-4 items-center bg-zinc-900">
           <div className="flex-1">
             <h3 className="font-semibold text-lg">Continuous DJ Mix</h3>
-            <p className="text-sm opacity-70">Render all transitions into a single FLAC.</p>
+            <p className="text-sm opacity-70">Render all transitions into a single continuous mix.</p>
             {mixData && (mixData.status === "pending" || mixData.status === "rendering") && (
               <p className="text-sm text-yellow-500 mt-2">Rendering mix...</p>
             )}
@@ -452,10 +568,10 @@ export function Player() {
             </p>
             <a
               href={api.queueMixAudioUrl(queueQuery.data.id)}
-              download="mix.flac"
+              download="mix.m4a"
               className="text-blue-400 text-sm hover:underline mt-2 self-start"
             >
-              Download FLAC
+              Download Audio
             </a>
           </div>
         </section>
@@ -478,9 +594,61 @@ export function Player() {
         </section>
       )}
 
+      {dialNotice && (
+        <p className="text-xs opacity-70 border border-amber-500/40 bg-amber-500/10 rounded px-3 py-2">
+          {dialNotice}
+        </p>
+      )}
+
+      {activeMode === "mix" &&
+        (timeline?.host ?? []).some(
+          (h) => position >= h.start && position < h.end + 1
+        ) && (
+          <p className="text-xs border border-purple-500/40 bg-purple-500/10 rounded px-3 py-2">
+            Host:{" "}
+            {
+              timeline!.host!.find(
+                (h) => position >= h.start && position < h.end + 1
+              )!.text
+            }
+          </p>
+        )}
+
       {activeMode === "mix" && activeTransition && (
         <section className="border border-blue-500/40 bg-blue-500/10 rounded p-3 flex flex-col gap-1">
-          <p className="text-xs opacity-70">Transition in progress</p>
+          <div className="flex items-center justify-between">
+            <p className="text-xs opacity-70">Transition in progress</p>
+            <div className="flex items-center gap-1">
+              {votedTransitions[activeTransition.index] ? (
+                <span className="text-xs opacity-60">
+                  noted (
+                  {votedTransitions[activeTransition.index] === "thumbs_up"
+                    ? "good"
+                    : "bad"}
+                  )
+                </span>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => voteOnTransition("thumbs_up")}
+                    title="This transition works"
+                    className="text-xs border rounded px-2 py-0.5 hover:bg-black/5 dark:hover:bg-white/10"
+                  >
+                    Good
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => voteOnTransition("thumbs_down")}
+                    title="Not feeling this one"
+                    className="text-xs border rounded px-2 py-0.5 hover:bg-black/5 dark:hover:bg-white/10"
+                  >
+                    Bad
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
           <p className="font-medium">{activeTransition.label}</p>
           {activeTransition.stems.length > 0 && (
             <p className="text-xs opacity-80">
@@ -498,6 +666,44 @@ export function Player() {
             A = {songById[activeTransition.from_song_id]?.title ?? "outgoing"} ·
             B = {songById[activeTransition.to_song_id]?.title ?? "incoming"}
           </p>
+        </section>
+      )}
+
+      {activeMode === "mix" && !activeTransition && feedbackTransition && (
+        <section className="border rounded px-3 py-2 flex items-center justify-between gap-2">
+          <p className="text-xs opacity-70 truncate">
+            That {feedbackTransition.label.toLowerCase()} transition
+            {songById[feedbackTransition.to_song_id]?.title
+              ? ` into ${songById[feedbackTransition.to_song_id]!.title}`
+              : ""}{" "}
+            — how was it?
+          </p>
+          {votedTransitions[feedbackTransition.index] ? (
+            <span className="text-xs opacity-60 shrink-0">
+              noted (
+              {votedTransitions[feedbackTransition.index] === "thumbs_up"
+                ? "good"
+                : "bad"}
+              )
+            </span>
+          ) : (
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => voteOnTransition("thumbs_up")}
+                className="text-xs border rounded px-2 py-0.5 hover:bg-black/5 dark:hover:bg-white/10"
+              >
+                Good
+              </button>
+              <button
+                type="button"
+                onClick={() => voteOnTransition("thumbs_down")}
+                className="text-xs border rounded px-2 py-0.5 hover:bg-black/5 dark:hover:bg-white/10"
+              >
+                Bad
+              </button>
+            </div>
+          )}
         </section>
       )}
 
@@ -530,6 +736,48 @@ export function Player() {
           >
             Next
           </button>
+        )}
+        {activeMode === "mix" && (
+          <>
+            <button
+              type="button"
+              onClick={skipToNextTransition}
+              disabled={!nextTransition}
+              title="Jump to just before the next transition"
+              className="border rounded px-4 py-2 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40"
+            >
+              Next transition
+            </button>
+            <div
+              className="flex items-center gap-1 border rounded px-2 py-1"
+              title="Bend the rest of the set (takes effect ~90s ahead)"
+            >
+              <span className="text-xs opacity-60 mr-1">Energy</span>
+              <button
+                type="button"
+                onClick={() => energyDial("down")}
+                title="Cool the rest of the set down"
+                className="text-xs rounded px-2 py-1 hover:bg-black/5 dark:hover:bg-white/10"
+              >
+                Down
+              </button>
+              <button
+                type="button"
+                onClick={() => energyDial("hold")}
+                className="text-xs rounded px-2 py-1 opacity-70 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/10"
+              >
+                hold
+              </button>
+              <button
+                type="button"
+                onClick={() => energyDial("up")}
+                title="Raise the energy of the rest of the set"
+                className="text-xs rounded px-2 py-1 hover:bg-black/5 dark:hover:bg-white/10"
+              >
+                Up
+              </button>
+            </div>
+          </>
         )}
         <span className="text-sm tabular-nums opacity-70">
           {formatTime(position)} / {formatTime(duration)}
