@@ -228,3 +228,95 @@ def test_download_song_skips_if_already_downloaded(song_id: str):
         row = db.get(Song, _uuid.UUID(song_id))
         assert row is not None
         assert row.status == SongStatus.downloaded
+
+
+def test_is_transient_classifier():
+    from app.workers.download import _is_transient
+
+    assert _is_transient(YouTubeDownloadError(
+        "ERROR: unable to download video data: HTTP Error 403: Forbidden"))
+    assert _is_transient(YouTubeDownloadError("HTTP Error 429: Too Many Requests"))
+    assert _is_transient(YouTubeDownloadError("The read operation timed out"))
+    assert not _is_transient(YouTubeDownloadError("Private video"))
+    assert not _is_transient(YouTubeDownloadError("Video unavailable"))
+    assert not _is_transient(YouTubeDownloadError("boom"))
+
+
+def test_download_song_retries_transient_403(song_id: str, tmp_path: Path):
+    """A 403 resets the song to `pending` (so the retried task can win the
+    claim again) and schedules a Celery retry instead of marking failed."""
+    storage = AsyncMock()
+    storage.path.return_value = tmp_path / "out.wav"
+    yt = MagicMock()
+    yt.download.side_effect = YouTubeDownloadError(
+        "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+    )
+
+    with (
+        patch("app.workers.download.get_storage", return_value=storage),
+        patch("app.workers.download.YouTubeService", return_value=yt),
+    ):
+        from app.workers.download import download_song
+
+        # Direct (eager) invocation makes self.retry re-raise the original
+        # exception rather than celery.exceptions.Retry.
+        with pytest.raises(YouTubeDownloadError):
+            download_song(song_id)
+
+    with SessionLocal() as db:
+        import uuid
+
+        row = db.get(Song, uuid.UUID(song_id))
+        assert row.status == SongStatus.pending   # claimable by the retry
+        assert row.error_text is None
+
+
+def test_download_song_403_fails_after_max_retries(song_id: str, tmp_path: Path):
+    storage = AsyncMock()
+    storage.path.return_value = tmp_path / "out.wav"
+    yt = MagicMock()
+    yt.download.side_effect = YouTubeDownloadError("HTTP Error 403: Forbidden")
+
+    with (
+        patch("app.workers.download.get_storage", return_value=storage),
+        patch("app.workers.download.YouTubeService", return_value=yt),
+    ):
+        from app.workers.download import download_song
+
+        # Simulate the final retry's execution context.
+        download_song.push_request(retries=download_song.max_retries)
+        try:
+            with pytest.raises(YouTubeDownloadError):
+                download_song.run(song_id)
+        finally:
+            download_song.pop_request()
+
+    with SessionLocal() as db:
+        import uuid
+
+        row = db.get(Song, uuid.UUID(song_id))
+        assert row.status == SongStatus.failed
+        assert "403" in (row.error_text or "")
+
+
+def test_download_song_permanent_error_fails_immediately(song_id: str, tmp_path: Path):
+    storage = AsyncMock()
+    storage.path.return_value = tmp_path / "out.wav"
+    yt = MagicMock()
+    yt.download.side_effect = YouTubeDownloadError("Video unavailable")
+
+    with (
+        patch("app.workers.download.get_storage", return_value=storage),
+        patch("app.workers.download.YouTubeService", return_value=yt),
+    ):
+        from app.workers.download import download_song
+
+        with pytest.raises(YouTubeDownloadError):
+            download_song(song_id)
+
+    assert yt.download.call_count == 1   # no retries burned on a dead video
+    with SessionLocal() as db:
+        import uuid
+
+        row = db.get(Song, uuid.UUID(song_id))
+        assert row.status == SongStatus.failed

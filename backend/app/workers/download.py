@@ -19,9 +19,35 @@ logger = logging.getLogger(__name__)
 # racing on the same audio file.
 CLAIMABLE_STATUSES = (SongStatus.pending, SongStatus.failed)
 
+# YouTube flakes routinely: signed googlevideo URLs expire between extract
+# and download (403), and per-IP throttling comes and goes (429). Those
+# succeed on a retry seconds later. Genuinely permanent failures (private,
+# removed, age-gated) must fail fast instead of burning retries.
+TRANSIENT_ERROR_MARKERS = (
+    "403", "429", "timed out", "timeout", "connection", "temporarily",
+    "temporary", "reset by peer", "incomplete read", "500", "502", "503",
+)
+PERMANENT_ERROR_MARKERS = (
+    "private video", "video unavailable", "removed", "age", "copyright",
+    "not available in your country",
+)
+MAX_DOWNLOAD_RETRIES = 3
+RETRY_BASE_COUNTDOWN_S = 15
 
-@celery_app.task(name="app.workers.download.download_song")
-def download_song(song_id: str) -> str | None:
+
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if any(m in msg for m in PERMANENT_ERROR_MARKERS):
+        return False
+    return any(m in msg for m in TRANSIENT_ERROR_MARKERS)
+
+
+@celery_app.task(
+    name="app.workers.download.download_song",
+    bind=True,
+    max_retries=MAX_DOWNLOAD_RETRIES,
+)
+def download_song(self, song_id: str) -> str | None:
     """Download the audio for a Song to local storage.
 
     Idempotent under concurrent dispatch: the pending/failed -> downloading
@@ -76,6 +102,27 @@ def download_song(song_id: str) -> str | None:
             yt.download(video_id, dest)
             asyncio.run(storage.upload_file(dest, key))
         except Exception as exc:
+            retries_left = self.max_retries - self.request.retries
+            if _is_transient(exc) and retries_left > 0:
+                # Reset to `pending` so the retried task can win the
+                # pending/failed -> downloading claim again (it would
+                # no-op against a row stuck in `downloading`).
+                logger.warning(
+                    "download_song: transient failure for %s (%s); "
+                    "retry %d/%d",
+                    video_id, exc,
+                    self.request.retries + 1, self.max_retries,
+                )
+                with SessionLocal() as db:
+                    song = db.get(Song, song_uuid)
+                    if song is not None:
+                        song.status = SongStatus.pending
+                        song.error_text = None
+                        db.commit()
+                raise self.retry(
+                    exc=exc,
+                    countdown=RETRY_BASE_COUNTDOWN_S * (self.request.retries + 1),
+                )
             logger.exception("download failed for %s", video_id)
             with SessionLocal() as db:
                 song = db.get(Song, song_uuid)
