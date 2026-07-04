@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import uuid
+import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
@@ -8,6 +10,7 @@ import soundfile as sf
 
 from sqlalchemy import select, update
 
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models import (
     Analysis,
@@ -18,6 +21,17 @@ from app.models import (
     QueueRender,
     QueueRenderStatus,
     Song,
+    Stems,
+    Transcription,
+)
+from app.models.lyrics import Lyrics, LyricsAlignmentStatus
+from app.services.host.overlay import apply_host_overlay
+from app.services.vocal_safety.safety import vocal_safe_regions
+from app.services.mixer.tempo_map import (
+    a_output_sample,
+    a_ramp_from_plan,
+    map_sample,
+    ramp_time_map,
 )
 from app.services.storage import get_storage
 from app.workers import celery_app
@@ -30,40 +44,37 @@ CLAIMABLE_STATUSES = (
 )
 
 
-def _get_mix0_sample(plan_json: list[dict], rate_A: float, T_orig: float, sr: int = 44100) -> int:
+def _get_mix0_sample(
+    plan_json: list[dict],
+    rate_A: float,
+    T_orig: float,
+    sr: int = 44100,
+    a_bpm: float | None = None,
+) -> int:
+    """Map a middle-song time (B of render0) to a sample in render0's
+    output. Shares tempo-map math with the executor so junctions can't
+    drift from where the audio actually sits: B pre-ramp plays at rate_A,
+    glides to native across the B-side ramp; A's seam is mapped through
+    the A-side meet-in-the-middle ramp when the plan carries one."""
     window = next(c for c in plan_json if c["tool"] == "set_transition_window")
-    tempo_ramp = next((c for c in plan_json if c["tool"] == "set_tempo_ramp"), None)
+    b_ramp = next(
+        (c for c in plan_json
+         if c["tool"] == "set_tempo_ramp" and c.get("song") != "A"),
+        None,
+    )
 
     a_seam_orig = window["from_song_time_start"]
     b_seam_orig = window["to_song_time_start"]
 
-    a_seam_samp = int(a_seam_orig * sr)
+    a_seam_samp = a_output_sample(plan_json, a_bpm, float(a_seam_orig), sr)
     b_seam_samp_post = int(b_seam_orig * sr / rate_A)
 
-    if tempo_ramp:
-        ramp_start_orig = tempo_ramp["start_time"]
-        ramp_end_orig = tempo_ramp["end_time"]
-        ramp_start_samp = int(ramp_start_orig * sr)
-        ramp_end_samp = int(ramp_end_orig * sr)
-        ramp_len = ramp_end_samp - ramp_start_samp
-
-        num_points = 10
-        t_source = np.linspace(0, ramp_len, num_points)
-        rates = np.linspace(rate_A, 1.0, num_points)
-        t_target = 0.0
-        for i in range(1, num_points):
-            dt = t_source[i] - t_source[i-1]
-            avg_rate = (rates[i] + rates[i-1]) / 2.0
-            t_target += dt / avg_rate
-
-        if T_orig >= ramp_end_orig:
-            ramp_end_target = int(ramp_start_samp / rate_A) + int(t_target)
-            stretched_B_sample = ramp_end_target + int((T_orig - ramp_end_orig) * sr)
-        elif T_orig >= ramp_start_orig:
-            fraction = (T_orig - ramp_start_orig) / (ramp_end_orig - ramp_start_orig)
-            stretched_B_sample = int(ramp_start_samp / rate_A) + int(t_target * fraction)
-        else:
-            stretched_B_sample = int(T_orig * sr / rate_A)
+    if b_ramp:
+        start = int(float(b_ramp["start_time"]) * sr)
+        end = int(float(b_ramp["end_time"]) * sr)
+        total = max(end, int(T_orig * sr)) + sr
+        pairs = ramp_time_map(total, start, end, rate_A, 1.0)
+        stretched_B_sample = map_sample(pairs, T_orig * sr)
     else:
         stretched_B_sample = int(T_orig * sr / rate_A)
 
@@ -166,9 +177,14 @@ def _build_timeline(
         a_seam_orig = _snap_downbeat(
             float(window["from_song_time_start"]), list(an_a.downbeats or [])
         )
-        a_seam_sample = int(round(a_seam_orig * sr))
+        # Through the A-side meet ramp when present (identity otherwise).
+        a_seam_sample = a_output_sample(plan, an_a.bpm, a_seam_orig, sr)
         seam_out = render_body_start[r] + (a_seam_sample - head_full_index[r])
-        sec_per_bar_a = (60.0 / an_a.bpm) * an_a.time_signature
+        a_ramp = a_ramp_from_plan(plan)
+        window_bpm = (
+            float(a_ramp.get("end_bpm") or an_a.bpm) if a_ramp else an_a.bpm
+        )
+        sec_per_bar_a = (60.0 / window_bpm) * an_a.time_signature
         trans_len = int(round(int(window.get("duration_bars", 0)) * sec_per_bar_a * sr))
         seam_out = max(0, min(seam_out, total_samples))
         end_out = max(seam_out, min(seam_out + trans_len, total_samples))
@@ -282,6 +298,35 @@ def stitch_queue(queue_id: str) -> str | None:
             if s is not None:
                 song_meta[sid] = {"title": s.title, "artist": s.artist}
 
+        # F11 host snapshot: queue-level voice settings plus song 1's
+        # vocal-safety inputs (the intro clip is placed in its first
+        # vocal-free span). All optional; the host degrades to silence.
+        queue_row = db.get(Queue, queue_uuid)
+        host_ctx = {
+            "occasion": queue_row.occasion if queue_row else None,
+            "vibe_note": queue_row.vibe_note if queue_row else None,
+            "frequency": queue_row.host_frequency if queue_row else None,
+            "persona": queue_row.host_persona if queue_row else None,
+        }
+        host_enabled = settings.tts_provider != "off" and (
+            (host_ctx["frequency"] or settings.host_frequency) != "off"
+        )
+        s1_segments = s1_aligned = s1_env_path = None
+        s1_duration = 0.0
+        if host_enabled:
+            s1_id = items[0].song_id
+            s1_song = db.get(Song, s1_id)
+            s1_duration = (s1_song.duration_seconds or 0.0) if s1_song else 0.0
+            s1_tr = db.scalar(
+                select(Transcription).where(Transcription.song_id == s1_id)
+            )
+            s1_segments = s1_tr.segments if s1_tr else None
+            s1_ly = db.scalar(select(Lyrics).where(Lyrics.song_id == s1_id))
+            if s1_ly and s1_ly.alignment_status == LyricsAlignmentStatus.success:
+                s1_aligned = s1_ly.aligned_words
+            s1_st = db.scalar(select(Stems).where(Stems.song_id == s1_id))
+            s1_env_path = s1_st.envelopes_path if s1_st else None
+
     # Now stitch!
     sr = 44100
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -328,25 +373,39 @@ def stitch_queue(queue_id: str) -> str | None:
             mid_song_id = items[i+1].song_id
             an_a = analyses[items[i].song_id]
             an_b = analyses[mid_song_id]
-            rate_A = an_a.bpm / an_b.bpm
-            
+
             plan0 = mp0.plan_json
             plan1 = mp1.plan_json
-            
-            tempo_ramp = next((c for c in plan0 if c["tool"] == "set_tempo_ramp"), None)
+
+            tempo_ramp = next(
+                (c for c in plan0
+                 if c["tool"] == "set_tempo_ramp" and c.get("song") != "A"),
+                None,
+            )
             window0 = next(c for c in plan0 if c["tool"] == "set_transition_window")
             window1 = next(c for c in plan1 if c["tool"] == "set_transition_window")
+
+            # Half/double-time beatmatch (window tempo_ratio) and the
+            # meet-in-the-middle A ramp both change B's stretch rate in
+            # render0 — the junction math must mirror the executor's.
+            ratio0 = float(window0.get("tempo_ratio") or 1.0)
+            a_ramp0 = a_ramp_from_plan(plan0)
+            crossfade_bpm0 = (
+                float(a_ramp0.get("end_bpm") or an_a.bpm) if a_ramp0 else an_a.bpm
+            )
+            rate_A = (crossfade_bpm0 * ratio0) / an_b.bpm
             
             a_seam1 = window1["from_song_time_start"]
             
             if tempo_ramp:
                 safe_start_T = tempo_ramp["end_time"]
             else:
-                # Estimate crossfade end
+                # Estimate crossfade end (one A-grid bar consumes ratio0
+                # B-bars of original audio under a half-time beatmatch).
                 b_seam0 = window0["to_song_time_start"]
                 dur_bars = window0["duration_bars"]
                 sec_per_bar_b = (60.0 / an_b.bpm) * an_b.time_signature
-                safe_start_T = b_seam0 + dur_bars * sec_per_bar_b
+                safe_start_T = b_seam0 + dur_bars * sec_per_bar_b * ratio0
 
             safe_end_T = a_seam1
             T_orig = (safe_start_T + safe_end_T) / 2.0
@@ -355,7 +414,7 @@ def stitch_queue(queue_id: str) -> str | None:
             if T_orig > safe_end_T:
                 T_orig = safe_end_T - 1.0
                 
-            S0 = _get_mix0_sample(plan0, rate_A, T_orig, sr)
+            S0 = _get_mix0_sample(plan0, rate_A, T_orig, sr, a_bpm=an_a.bpm)
             S1 = _get_mix1_sample(T_orig, sr)
             
             # To accumulate cleanly, we replace stitched[-1] with its sliced version
@@ -407,14 +466,64 @@ def stitch_queue(queue_id: str) -> str | None:
             logger.exception("stitch_queue: timeline build failed for %s", queue_id)
             timeline = None
 
-        out_dest = tmp / "final.flac"
-        sf.write(str(out_dest), final_audio, sr, format="FLAC", subtype="PCM_16")
+        # F11: the host voice — set intro, occasional mic drops. Purely
+        # additive and failure-tolerant; the mix ships voiceless on any
+        # problem.
+        if host_enabled:
+            song1_regions = None
+            if s1_segments and s1_env_path:
+                try:
+                    env = json.loads(
+                        asyncio.run(storage.read(s1_env_path)).decode("utf-8")
+                    )
+                    song1_regions = vocal_safe_regions(
+                        transcription_segments=s1_segments,
+                        envelope=env,
+                        aligned_words=s1_aligned,
+                        duration_seconds=s1_duration,
+                    )
+                except Exception:
+                    song1_regions = None
+            host_events = apply_host_overlay(
+                final_audio, sr, timeline, storage,
+                songs=[song_meta.get(sid, {}) for sid in song_ids],
+                occasion=host_ctx["occasion"],
+                vibe_note=host_ctx["vibe_note"],
+                queue_frequency=host_ctx["frequency"],
+                queue_persona=host_ctx["persona"],
+                song1_safe_regions=song1_regions,
+            )
+            if host_events and timeline is not None:
+                timeline["host"] = host_events
+
+        wav_dest = tmp / "final.wav"
+        out_dest = tmp / "final.m4a"
+        sf.write(str(wav_dest), final_audio, sr, format="WAV", subtype="PCM_16")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(wav_dest),
+            "-c:a", "aac",
+            "-b:a", "256k",
+            "-movflags", "+faststart",
+            str(out_dest)
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            # CalledProcessError's message omits stderr — log it or the
+            # actual encoder failure is invisible.
+            logger.error(
+                "stitch_queue: ffmpeg AAC encode failed for %s: %s",
+                queue_id, (exc.stderr or b"").decode(errors="replace").strip(),
+            )
+            raise
 
         with open(out_dest, "rb") as f:
-            flac_bytes = f.read()
+            audio_bytes = f.read()
 
-    key = f"queue_mixes/{queue_id}.flac"
-    asyncio.run(storage.write(key, flac_bytes))
+    key = f"queue_mixes/{queue_id}.m4a"
+    asyncio.run(storage.write(key, audio_bytes))
 
     with SessionLocal() as db:
         row = db.get(QueueRender, render_row_id)
@@ -426,7 +535,7 @@ def stitch_queue(queue_id: str) -> str | None:
             db.commit()
 
     # Stitching just wrote the largest single artifact (the whole-queue
-    # FLAC) — nudge the LRU evictor (no-op under budget). By name to stay
+    # M4A) — nudge the LRU evictor (no-op under budget). By name to stay
     # decoupled from the evictor module.
     try:
         celery_app.send_task("app.workers.evict_cache.enforce_cache_budget")

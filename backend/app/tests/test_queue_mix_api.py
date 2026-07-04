@@ -133,7 +133,7 @@ def test_get_mix_returns_row(db_session: Session):
     db_session.add(QueueRender(
         queue_id=q.id,
         status=QueueRenderStatus.ready,
-        rendered_audio_path="queue_mixes/x.flac",
+        rendered_audio_path="queue_mixes/x.m4a",
     ))
     db_session.flush()
     client = _client(db_session)
@@ -141,7 +141,7 @@ def test_get_mix_returns_row(db_session: Session):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ready"
-    assert body["rendered_audio_path"] == "queue_mixes/x.flac"
+    assert body["rendered_audio_path"] == "queue_mixes/x.m4a"
 
 
 def test_get_mix_audio_404_when_not_ready(db_session: Session):
@@ -153,11 +153,11 @@ def test_get_mix_audio_404_when_not_ready(db_session: Session):
     assert r.status_code == 404
 
 
-def test_get_mix_audio_streams_flac(db_session: Session):
-    """When ready, the route streams the FLAC bytes with
+def test_get_mix_audio_streams_m4a(db_session: Session):
+    """When ready, the route streams the M4A bytes with
     Content-Disposition: attachment."""
     q = Queue(locked=True); db_session.add(q); db_session.flush()
-    key = f"queue_mixes/{q.id}.flac"
+    key = f"queue_mixes/{q.id}.m4a"
     db_session.add(QueueRender(
         queue_id=q.id,
         status=QueueRenderStatus.ready,
@@ -166,11 +166,11 @@ def test_get_mix_audio_streams_flac(db_session: Session):
     db_session.flush()
 
     from app.services.storage import get_storage
-    asyncio.run(get_storage().write(key, b"fLaC-placeholder"))
+    asyncio.run(get_storage().write(key, b"m4a-placeholder"))
 
     client = _client(db_session)
     r = client.get(f"/api/queues/{q.id}/mix/audio")
     assert r.status_code == 200
-    assert r.content == b"fLaC-placeholder"
+    assert r.content == b"m4a-placeholder"
     cd = r.headers.get("content-disposition", "")
-    assert "attachment" in cd and "mix.flac" in cd
+    assert "attachment" in cd and "mix.m4a" in cd

@@ -29,7 +29,7 @@ class QueueRender(Base):
         unique=True,
     )
 
-    # StorageBackend key, e.g. "queue_mixes/<queue_id>.flac". Null until rendered.
+    # StorageBackend key, e.g. "queue_mixes/<queue_id>.m4a". Null until rendered.
     rendered_audio_path: Mapped[str | None] = mapped_column(String, nullable=True)
 
     status: Mapped[QueueRenderStatus] = mapped_column(
@@ -41,7 +41,7 @@ class QueueRender(Base):
     error_text: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Phase 10: output-timeline map for the player's transition indicator.
-    # Written by stitch_queue alongside the FLAC. Shape:
+    # Written by stitch_queue alongside the M4A. Shape:
     #   {"duration": float,
     #    "songs": [{"index", "song_id", "title", "artist", "start", "end"}],
     #    "transitions": [{"index", "from_song_id", "to_song_id", "start",

@@ -42,9 +42,14 @@ def _force_local_storage_for_tests() -> Generator[Path, None, None]:
         original_backend = settings.storage_backend
         original_root = settings.local_storage_path
         original_modal_id = settings.modal_token_id
+        original_tts = settings.tts_provider
         settings.storage_backend = "local"
         settings.local_storage_path = root
         settings.modal_token_id = ""
+        # The TTS host must never run real LLM/TTS inside unit tests —
+        # with a live .env it genuinely will (kokoro synthesizes locally).
+        # Host tests patch the provider back on explicitly.
+        settings.tts_provider = "off"
         _storage_factory.get_storage.cache_clear()
         try:
             yield root
@@ -52,6 +57,7 @@ def _force_local_storage_for_tests() -> Generator[Path, None, None]:
             settings.storage_backend = original_backend
             settings.local_storage_path = original_root
             settings.modal_token_id = original_modal_id
+            settings.tts_provider = original_tts
             _storage_factory.get_storage.cache_clear()
 
 

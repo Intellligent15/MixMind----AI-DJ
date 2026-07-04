@@ -148,9 +148,9 @@ def test_stitch_queue_happy_path(locked_queue_with_mixes):
             QueueRender.queue_id == uuid.UUID(locked_queue_with_mixes)
         ))
         assert qr.status == QueueRenderStatus.ready
-        assert qr.rendered_audio_path == f"queue_mixes/{locked_queue_with_mixes}.flac"
+        assert qr.rendered_audio_path == f"queue_mixes/{locked_queue_with_mixes}.m4a"
         assert qr.error_text is None
-        # Phase 10: the player timeline is persisted alongside the FLAC.
+        # Phase 10: the player timeline is persisted alongside the M4A.
         tl = qr.timeline
         assert tl is not None
         assert len(tl["songs"]) == 3
@@ -222,14 +222,14 @@ def test_stitch_queue_warns_when_no_queue_render_row():
     assert res is None
 
 
-def test_stitch_queue_persists_flac_key_and_calls_storage_write():
+def test_stitch_queue_persists_m4a_key_and_calls_storage_write():
     queue_id = _seed_locked_queue(n_songs=3)
     storage = _storage_writing_stereo_wav()
     with patch("app.workers.stitch_queue.get_storage", return_value=storage):
         from app.workers.stitch_queue import stitch_queue
         stitch_queue(queue_id)
 
-    expected_key = f"queue_mixes/{queue_id}.flac"
+    expected_key = f"queue_mixes/{queue_id}.m4a"
     assert storage.write.call_count == 1
     call = storage.write.call_args
     assert call.args[0] == expected_key
