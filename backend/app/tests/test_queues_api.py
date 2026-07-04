@@ -80,7 +80,7 @@ def test_create_queue_replaces_prior_queues(db_session: Session):
 
 
 def test_create_queue_deletes_rendered_mix_file(db_session: Session):
-    """When a prior Queue had a rendered FLAC, create_queue tells the
+    """When a prior Queue had a rendered M4A, create_queue tells the
     storage backend to delete it."""
     from unittest.mock import AsyncMock, patch
 
@@ -92,7 +92,7 @@ def test_create_queue_deletes_rendered_mix_file(db_session: Session):
     db_session.add(QueueRender(
         queue_id=prior.id,
         status=QueueRenderStatus.ready,
-        rendered_audio_path="queue_mixes/old.flac",
+        rendered_audio_path="queue_mixes/old.m4a",
     ))
     db_session.flush()
 
@@ -102,7 +102,7 @@ def test_create_queue_deletes_rendered_mix_file(db_session: Session):
     with patch("app.services.storage.get_storage", return_value=storage):
         r = client.post("/api/queues")
     assert r.status_code == 201
-    storage.delete.assert_awaited_once_with("queue_mixes/old.flac")
+    storage.delete.assert_awaited_once_with("queue_mixes/old.m4a")
 
 
 def test_create_queue_deletes_per_pair_mix_renders(db_session: Session):
@@ -121,7 +121,7 @@ def test_create_queue_deletes_per_pair_mix_renders(db_session: Session):
     db_session.add(QueueRender(
         queue_id=prior.id,
         status=QueueRenderStatus.ready,
-        rendered_audio_path="queue_mixes/old.flac",
+        rendered_audio_path="queue_mixes/old.m4a",
     ))
     db_session.add(MixPlan(
         queue_id=prior.id,
@@ -139,7 +139,7 @@ def test_create_queue_deletes_per_pair_mix_renders(db_session: Session):
         r = client.post("/api/queues")
     assert r.status_code == 201
     deleted = {c.args[0] for c in storage.delete.await_args_list}
-    assert "queue_mixes/old.flac" in deleted
+    assert "queue_mixes/old.m4a" in deleted
     assert "mixes/pair.wav" in deleted
 
 
@@ -539,3 +539,35 @@ def test_lock_404_unknown_queue(db_session: Session):
     client = _client(db_session)
     r = client.post("/api/queues/00000000-0000-0000-0000-000000000000/lock")
     assert r.status_code == 404
+
+
+def test_add_item_kicks_pipeline_eagerly(db_session: Session):
+    """Queueing a song signals intent to mix: pipeline_requested flips on
+    immediately (so the in-flight download auto-chains into analysis) and
+    an already-downloaded song gets its analyze dispatched right away —
+    that's what unlocks Suggest Order before the queue is locked."""
+    queue = Queue()
+    pending = _make_song(db_session, "eager-pending-vid")
+    downloaded = _make_song(db_session, "eager-dl-vid", SongStatus.downloaded)
+    db_session.add(queue)
+    db_session.flush()
+    client = _client(db_session)
+    with (
+        patch("app.api.queues.download_song") as download_mock,
+        patch("app.api.queues.analyze_song") as analyze_mock,
+    ):
+        client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(pending.id)}
+        )
+        client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(downloaded.id)}
+        )
+    # Fresh song: flag only — its already-dispatched download will chain.
+    download_mock.apply_async.assert_not_called()
+    assert pending.pipeline_requested is True
+    # Downloaded song: analysis starts now, not at lock time.
+    analyze_mock.apply_async.assert_called_once()
+    assert analyze_mock.apply_async.call_args.kwargs.get("args") \
+        or analyze_mock.apply_async.call_args[1].get("args") \
+        or analyze_mock.apply_async.call_args[0]
+    assert downloaded.pipeline_requested is True

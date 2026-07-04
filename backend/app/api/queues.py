@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,7 +19,13 @@ from app.models import (
     Stems,
     Transcription,
 )
-from app.schemas import QueueItemAdd, QueueRead, QueueReorder, QueueRenderRead
+from app.schemas import (
+    QueueContextUpdate,
+    QueueItemAdd,
+    QueueRead,
+    QueueRenderRead,
+    QueueReorder,
+)
 from app.workers import (
     PRI_ANALYZE,
     PRI_DOWNLOAD,
@@ -182,11 +190,13 @@ def add_queue_item(
     song.last_accessed_at = datetime.now(timezone.utc)
     db.commit()
 
-    # NOTE: POST /api/songs already dispatches download_song on song
-    # creation, and POST /lock catches anything still pending. Dispatching
-    # again here used to race with the songs-API dispatch — two parallel
-    # yt-dlp processes writing the same .wav, one would fail and mark the
-    # song failed even though the audio file was on disk.
+    # Queueing signals intent to mix — start the pipeline NOW instead of
+    # waiting for lock: analysis unlocks Suggest Order pre-lock, and
+    # stems/transcription done early shorten the post-lock wait.
+    # dispatch_download=False because POST /api/songs already dispatched
+    # the download for fresh songs — a second parallel yt-dlp writing the
+    # same .wav would race it (one fails and marks the song failed).
+    _enqueue_pipeline_for_song(song, db, dispatch_download=False)
 
     db.refresh(queue)
     return queue
@@ -250,7 +260,232 @@ def reorder_queue_items(
     return queue
 
 
-def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
+# A re-planned transition needs render + stitch time before the playhead
+# reaches it; transitions starting sooner than this stay as rendered.
+ENERGY_DIAL_LEAD_SECONDS = 90.0
+
+
+class EnergyDialRequest(BaseModel):
+    direction: Literal["up", "hold", "down"]
+    position_seconds: float = 0.0
+
+
+@router.post("/{queue_id}/energy")
+def set_energy_dial(
+    queue_id: uuid.UUID,
+    payload: "EnergyDialRequest",
+    db: Session = Depends(get_db),
+) -> dict:
+    """Live energy dial: bend the not-yet-played remainder of the set.
+
+    Selects transitions starting >= ENERGY_DIAL_LEAD_SECONDS ahead of the
+    playhead, stamps them with the bias, re-plans + re-renders just those
+    pairs and re-stitches. Content before the first changed pair is
+    time-identical, so the player can hot-swap and keep its position.
+    """
+    from app.models import MixPlanStatus, QueueRender, QueueRenderStatus
+
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if not queue.locked:
+        raise HTTPException(status_code=409, detail="queue is not locked")
+
+    render = db.scalar(
+        select(QueueRender).where(QueueRender.queue_id == queue_id)
+    )
+    if render is None or not (render.timeline or {}).get("transitions"):
+        raise HTTPException(
+            status_code=409, detail="no rendered mix timeline yet"
+        )
+    if render.status == QueueRenderStatus.rendering:
+        raise HTTPException(
+            status_code=409,
+            detail="queue mix is being stitched; try again when it lands",
+        )
+
+    bias = None if payload.direction == "hold" else payload.direction
+    horizon = payload.position_seconds + ENERGY_DIAL_LEAD_SECONDS
+    affected: list[int] = []
+    for tr in render.timeline["transitions"]:
+        if tr["start"] < horizon:
+            continue
+        plan = db.scalar(
+            select(MixPlan)
+            .where(MixPlan.queue_id == queue_id)
+            .where(MixPlan.from_song_id == uuid.UUID(tr["from_song_id"]))
+            .where(MixPlan.to_song_id == uuid.UUID(tr["to_song_id"]))
+        )
+        if plan is None or plan.status == MixPlanStatus.rendering:
+            continue
+        if (plan.energy_bias or None) == bias:
+            continue  # already pointing that way — don't burn a render
+        plan.energy_bias = bias
+        plan.reroll_nonce = (plan.reroll_nonce or 0) + 1
+        plan.plan_json = None
+        plan.rendered_audio_path = None
+        plan.status = MixPlanStatus.pending
+        plan.error_text = None
+        affected.append(tr["index"])
+    db.commit()
+
+    if not affected:
+        return {"affected_transitions": [], "direction": payload.direction}
+
+    from app.workers.auto_stitch import reset_and_dispatch_stitch
+
+    reset_and_dispatch_stitch(queue_id, db)
+    return {
+        "affected_transitions": affected,
+        "direction": payload.direction,
+        "lead_seconds": ENERGY_DIAL_LEAD_SECONDS,
+    }
+
+
+@router.get("/meta/context_options")
+def list_context_options() -> dict:
+    """Occasion + arc-template menus for the queue builder UI."""
+    from app.services.mixer.occasions import ARC_TEMPLATES, OCCASIONS
+
+    from app.services.host.script import HOST_PERSONAS
+
+    return {
+        "occasions": [
+            {"id": o.id, "label": o.label, "default_arc": o.default_arc}
+            for o in OCCASIONS.values()
+        ],
+        "arcs": [
+            {"id": a.id, "label": a.label, "description": a.description}
+            for a in ARC_TEMPLATES.values()
+        ],
+        "host_frequencies": ["off", "intro_only", "sparse", "chatty"],
+        "host_personas": sorted(HOST_PERSONAS),
+    }
+
+
+@router.patch("/{queue_id}", response_model=QueueRead)
+def update_queue_context(
+    queue_id: uuid.UUID,
+    payload: QueueContextUpdate,
+    db: Session = Depends(get_db),
+) -> Queue:
+    """Set the gig context: occasion, vibe note, arc template, hook
+    teasing. Allowed until the queue is locked (the planners snapshot it
+    at plan time)."""
+    from app.services.mixer.occasions import ARC_TEMPLATES, OCCASIONS
+
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if queue.locked:
+        raise HTTPException(status_code=409, detail="queue is locked")
+
+    fields = payload.model_dump(exclude_unset=True)
+    if "occasion" in fields and fields["occasion"] is not None \
+            and fields["occasion"] not in OCCASIONS:
+        raise HTTPException(status_code=422, detail="unknown occasion")
+    if "arc_template" in fields and fields["arc_template"] is not None \
+            and fields["arc_template"] not in ARC_TEMPLATES:
+        raise HTTPException(status_code=422, detail="unknown arc_template")
+    if "host_frequency" in fields and fields["host_frequency"] is not None \
+            and fields["host_frequency"] not in (
+                "off", "intro_only", "sparse", "chatty"):
+        raise HTTPException(status_code=422, detail="unknown host_frequency")
+    if "host_persona" in fields and fields["host_persona"] is not None:
+        from app.services.host.script import HOST_PERSONAS
+
+        if fields["host_persona"] not in HOST_PERSONAS:
+            raise HTTPException(status_code=422, detail="unknown host_persona")
+    for name, value in fields.items():
+        setattr(queue, name, value)
+    db.commit()
+    db.refresh(queue)
+    return queue
+
+
+@router.post("/{queue_id}/suggest_order")
+def suggest_queue_order(
+    queue_id: uuid.UUID,
+    pin_first: bool = True,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Propose a track order that minimizes key/tempo/energy/genre
+    friction across the whole set. Suggestion only — the caller applies
+    it via the existing reorder PATCH. Requires every song analyzed."""
+    from app.models import Analysis
+    from app.services.mixer.ordering import (
+        PairInput,
+        edge_info,
+        order_cost,
+        suggest_order,
+    )
+
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if queue.locked:
+        raise HTTPException(status_code=409, detail="queue is locked")
+    items = sorted(queue.items, key=lambda it: it.position)
+    if len(items) < 3:
+        raise HTTPException(
+            status_code=409, detail="need at least 3 songs to reorder"
+        )
+
+    inputs: list[PairInput] = []
+    missing: list[str] = []
+    for item in items:
+        song = db.get(Song, item.song_id)
+        analysis = db.scalar(
+            select(Analysis).where(Analysis.song_id == item.song_id)
+        )
+        if song is None or analysis is None or not analysis.bpm:
+            missing.append(song.title if song else str(item.song_id))
+            continue
+        genres = tuple(
+            (analysis.tags or {}).get("genres") or []
+        ) if analysis.tags else ()
+        inputs.append(PairInput(
+            song_id=str(item.song_id),
+            title=song.title,
+            bpm=analysis.bpm,
+            key=analysis.key,
+            camelot_key=analysis.camelot_key,
+            energy_curve=list(analysis.energy_curve or []),
+            genres=genres,
+        ))
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "still analyzing (ordering needs BPM/key/energy): "
+                + ", ".join(missing)
+                + " — try again in a moment"
+            ),
+        )
+
+    order, edges = suggest_order(inputs, pin_first=pin_first)
+    current = list(range(len(inputs)))
+    current_edges = [
+        edge_info(inputs[i], inputs[i + 1]) for i in range(len(inputs) - 1)
+    ]
+    suggested_cost = order_cost(inputs, order)
+    current_cost = order_cost(inputs, current)
+    # Item ids in suggested order — directly usable by the reorder PATCH.
+    item_by_song = {str(it.song_id): it.id for it in items}
+    return {
+        "order": [inputs[i].song_id for i in order],
+        "ordered_item_ids": [item_by_song[inputs[i].song_id] for i in order],
+        "edges": [e.__dict__ for e in edges],
+        "current_edges": [e.__dict__ for e in current_edges],
+        "current_cost": round(current_cost, 3),
+        "suggested_cost": round(suggested_cost, 3),
+        "improved": suggested_cost + 1e-9 < current_cost,
+    }
+
+
+def _enqueue_pipeline_for_song(
+    song: Song, db: Session, dispatch_download: bool = True
+) -> None:
     """Kick the appropriate next pipeline stage for one song.
 
     Workers auto-chain on success (download→analyze→separate→transcribe)
@@ -259,6 +494,12 @@ def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
     (`downloading`/`analyzing`/etc.) are no-ops — the in-flight worker
     will auto-dispatch its successor on completion. That auto-chain is
     what fixes the "lock-during-download stalls the pipeline" bug.
+
+    ``dispatch_download=False`` is for callers that run right after song
+    creation (add-to-queue): POST /api/songs already dispatched the
+    download, and a second yt-dlp writing the same WAV races the first.
+    Setting `pipeline_requested` alone is enough there — the in-flight
+    download auto-chains into analyze when it lands.
 
     Lyrics fetch is fire-and-forget, independent of the audio pipeline.
     """
@@ -304,7 +545,10 @@ def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
 
     # Idle states: kick the next-needed stage. Auto-chain handles the rest.
     if song.status in (SongStatus.pending, SongStatus.failed) and not song.audio_path:
-        download_song.apply_async(args=[sid], priority=PRI_DOWNLOAD)
+        # A failed download is never in flight, so retrying is always safe;
+        # a `pending` one may have JUST been dispatched by song creation.
+        if song.status == SongStatus.failed or dispatch_download:
+            download_song.apply_async(args=[sid], priority=PRI_DOWNLOAD)
     elif song.status in (SongStatus.downloaded, SongStatus.failed):
         analyze_song.apply_async(args=[sid], priority=PRI_ANALYZE)
     elif song.status in (SongStatus.analyzed, SongStatus.ready):
@@ -405,5 +649,12 @@ async def get_queue_mix_audio(
     render_row = db.scalar(select(QueueRender).where(QueueRender.queue_id == queue_id))
     if not render_row or render_row.status != QueueRenderStatus.ready or not render_row.rendered_audio_path:
         raise HTTPException(status_code=404, detail="mix audio not ready")
-        
-    return await _stream_audio_response(render_row.rendered_audio_path, "audio/flac", range, download_filename="mix.flac")
+
+    # Rows rendered before the AAC switch still point at .flac keys.
+    if render_row.rendered_audio_path.endswith(".flac"):
+        media_type, filename = "audio/flac", "mix.flac"
+    else:
+        media_type, filename = "audio/mp4", "mix.m4a"
+    return await _stream_audio_response(
+        render_row.rendered_audio_path, media_type, range, download_filename=filename
+    )

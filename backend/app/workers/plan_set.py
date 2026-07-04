@@ -116,6 +116,9 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
         items = sorted(queue.items, key=lambda it: it.position)
         if len(items) < 2:
             return None
+        queue_occasion = queue.occasion
+        queue_vibe_note = queue.vibe_note
+        queue_arc_template = queue.arc_template
 
         songs_payload: list[dict] = []
         for idx, item in enumerate(items):
@@ -150,11 +153,42 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
             if p.from_song_id in song_order
         }
 
+    # Occasion / arc / vibe context (F7 + F10): plain-language guidance
+    # plus per-pair energy targets interpolated from the arc template.
+    from app.services.mixer.occasions import (
+        OCCASIONS,
+        arc_targets_for_pairs,
+        occasion_context,
+    )
+
+    set_context = occasion_context(queue_occasion, queue_vibe_note)
+    try:
+        from app.services.feedback.summary import feedback_context
+
+        with SessionLocal() as db:
+            fb_line = feedback_context(db)
+        if fb_line:
+            set_context["listener_feedback"] = fb_line
+    except Exception:  # feedback must never block set planning
+        logger.warning("plan_set: feedback summary failed", exc_info=True)
+    arc_id = queue_arc_template or (
+        OCCASIONS[queue_occasion].default_arc
+        if queue_occasion in OCCASIONS else None
+    )
+    if arc_id:
+        targets = arc_targets_for_pairs(arc_id, len(songs_payload) - 1)
+        if targets:
+            set_context["energy_targets"] = (
+                f"arc '{arc_id}': per-pair target energies {targets} — "
+                "assign styles so each transition lands near its target "
+                "(high target = energetic styles, low = gentle ones)"
+            )
+
     provider = get_llm_provider()
     obj = asyncio.run(
         provider.complete_json(
             system=SET_PLAN_SYSTEM_PROMPT,
-            user=set_plan_user_prompt(songs_payload),
+            user=set_plan_user_prompt(songs_payload, set_context or None),
             cache_namespace="set_plan_logs",
         )
     )

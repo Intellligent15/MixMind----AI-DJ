@@ -4,7 +4,15 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -27,6 +35,25 @@ class Queue(Base):
     locked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # ------- occasion / set-shape context (services/mixer/occasions.py) -----
+    # What kind of gig this is ("house_party", "gym", ...). Biases the set
+    # planner's arc, per-pair style choices, and (later) the host persona.
+    occasion: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Free-text vibe note from the user, passed verbatim to the planners.
+    vibe_note: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # Named energy-arc template ("slow_burn", "wave", ...) sampled per pair
+    # into the set-planner prompt.
+    arc_template: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Opt-in hook teasing (F9): B's vocal hook teased over A pre-transition.
+    tease_hooks: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    # TTS host (F11). frequency: "off" | "intro_only" | "sparse" | "chatty"
+    # (null = settings default); persona: "hype" | "latenight" | "radio" |
+    # "minimal" (null = occasion default).
+    host_frequency: Mapped[str | None] = mapped_column(String, nullable=True)
+    host_persona: Mapped[str | None] = mapped_column(String, nullable=True)
 
     items: Mapped[list["QueueItem"]] = relationship(
         "QueueItem",

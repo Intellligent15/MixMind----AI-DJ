@@ -25,7 +25,25 @@ class QueueRead(BaseModel):
     locked: bool
     created_at: datetime
     locked_at: datetime | None
+    occasion: str | None = None
+    vibe_note: str | None = None
+    arc_template: str | None = None
+    tease_hooks: bool = False
+    host_frequency: str | None = None
+    host_persona: str | None = None
     items: list[QueueItemRead]
+
+
+class QueueContextUpdate(BaseModel):
+    """PATCH /api/queues/{id} — occasion / vibe / arc / tease settings.
+    All optional; only provided fields change."""
+
+    occasion: str | None = None
+    vibe_note: str | None = None
+    arc_template: str | None = None
+    tease_hooks: bool | None = None
+    host_frequency: str | None = None
+    host_persona: str | None = None
 
 
 class QueueItemAdd(BaseModel):

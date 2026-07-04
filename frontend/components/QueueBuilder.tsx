@@ -20,8 +20,126 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { api, isStatusError, type Queue, type SearchResult } from "@/lib/api";
+import {
+  api,
+  isStatusError,
+  type OrderSuggestion,
+  type Queue,
+  type QueueContextUpdate,
+  type SearchResult,
+} from "@/lib/api";
 import { QueueItemRow } from "./QueueItemRow";
+
+function GigContext({ queue }: { queue: Queue }) {
+  const qc = useQueryClient();
+  const options = useQuery({
+    queryKey: ["queue-context-options"],
+    queryFn: api.getContextOptions,
+    staleTime: Infinity,
+  });
+  const [note, setNote] = useState(queue.vibe_note ?? "");
+  const update = useMutation({
+    mutationFn: (ctx: QueueContextUpdate) =>
+      api.updateQueueContext(queue.id, ctx),
+    onSuccess: (q) => qc.setQueryData(["queue", "current"], q),
+  });
+
+  if (!options.data) return null;
+  return (
+    <div className="flex flex-col gap-2 border rounded p-3 mb-4">
+      <p className="text-xs font-semibold opacity-70">The gig</p>
+      <div className="flex flex-wrap gap-1.5">
+        {options.data.occasions.map((o) => (
+          <button
+            key={o.id}
+            type="button"
+            onClick={() =>
+              update.mutate({
+                occasion: queue.occasion === o.id ? null : o.id,
+              })
+            }
+            className={
+              "text-xs border rounded-full px-2.5 py-1 " +
+              (queue.occasion === o.id
+                ? "bg-emerald-500/30 border-emerald-500/50"
+                : "hover:bg-black/5 dark:hover:bg-white/10")
+            }
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex gap-2 items-center">
+        <select
+          value={queue.arc_template ?? ""}
+          onChange={(e) =>
+            update.mutate({ arc_template: e.target.value || null })
+          }
+          className="text-xs border rounded px-2 py-1 bg-transparent"
+        >
+          <option value="">Arc: auto</option>
+          {options.data.arcs.map((a) => (
+            <option key={a.id} value={a.id} title={a.description}>
+              Arc: {a.label}
+            </option>
+          ))}
+        </select>
+        <label className="text-xs flex items-center gap-1.5 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={queue.tease_hooks}
+            onChange={(e) => update.mutate({ tease_hooks: e.target.checked })}
+          />
+          Tease hooks
+        </label>
+      </div>
+      <div className="flex gap-2 items-center">
+        <select
+          value={queue.host_frequency ?? ""}
+          onChange={(e) =>
+            update.mutate({ host_frequency: e.target.value || null })
+          }
+          title="How often the host voice talks over the mix"
+          className="text-xs border rounded px-2 py-1 bg-transparent"
+        >
+          <option value="">Host: default</option>
+          {options.data.host_frequencies.map((f) => (
+            <option key={f} value={f}>
+              Host: {f.replace("_", " ")}
+            </option>
+          ))}
+        </select>
+        <select
+          value={queue.host_persona ?? ""}
+          onChange={(e) =>
+            update.mutate({ host_persona: e.target.value || null })
+          }
+          title="The host's voice personality"
+          className="text-xs border rounded px-2 py-1 bg-transparent"
+        >
+          <option value="">Voice: auto</option>
+          {options.data.host_personas.map((p) => (
+            <option key={p} value={p}>
+              Voice: {p}
+            </option>
+          ))}
+        </select>
+      </div>
+      <input
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        onBlur={() => {
+          if (note !== (queue.vibe_note ?? "")) {
+            update.mutate({ vibe_note: note || null });
+          }
+        }}
+        maxLength={300}
+        placeholder="Vibe note for the DJ (optional) — e.g. '90s hip-hop birthday, keep it fun'"
+        className="text-xs border rounded px-2 py-1.5 bg-transparent"
+      />
+    </div>
+  );
+}
 
 const QUEUE_CAP = 20;
 const NON_TERMINAL: ReadonlySet<string> = new Set([
@@ -234,6 +352,23 @@ export function QueueBuilder() {
     onSuccess: (q) => qc.setQueryData(["queue", "current"], q),
   });
 
+  // Auto-ordering: fetch a proposal, show the diff, apply via the normal
+  // reorder endpoint. First track stays pinned (server default).
+  const [suggestion, setSuggestion] = useState<OrderSuggestion | null>(null);
+  const suggest = useMutation({
+    mutationFn: () => {
+      if (!queue.data) throw new Error("queue not ready");
+      return api.suggestOrder(queue.data.id);
+    },
+    onSuccess: (s) => setSuggestion(s),
+  });
+  const applySuggestion = () => {
+    if (!suggestion) return;
+    setLocalOrder(suggestion.ordered_item_ids);
+    reorder.mutate(suggestion.ordered_item_ids);
+    setSuggestion(null);
+  };
+
   if (queue.isLoading || !queue.data) {
     return <p className="text-sm opacity-70">Loading queue…</p>;
   }
@@ -282,6 +417,12 @@ export function QueueBuilder() {
   const items = itemsInOrder;
   const full = items.length >= QUEUE_CAP;
   const empty = items.length === 0;
+  // Ordering needs each song's BPM/key/energy, which exist once the
+  // analyze stage has finished (status past "analyzing").
+  const ANALYZED_STATUSES = ["analyzed", "separating", "transcribing", "ready"];
+  const allAnalyzed =
+    items.length >= 3 &&
+    items.every((i) => ANALYZED_STATUSES.includes(i.song.status));
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -296,6 +437,7 @@ export function QueueBuilder() {
       </div>
 
       <div>
+        <GigContext queue={queue.data} />
         <div className="flex items-baseline justify-between mb-3">
           <h2 className="font-semibold">
             Queue
@@ -303,15 +445,113 @@ export function QueueBuilder() {
               {items.length}/{QUEUE_CAP}
             </span>
           </h2>
-          <button
-            type="button"
-            onClick={() => lock.mutate()}
-            disabled={empty || lock.isPending}
-            className="border rounded px-4 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40"
-          >
-            {lock.isPending ? "Locking…" : "Done"}
-          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => suggest.mutate()}
+              disabled={!allAnalyzed || suggest.isPending}
+              title={
+                allAnalyzed
+                  ? "Reorder the crate to minimize key/tempo/energy friction (keeps your opener)"
+                  : items.length < 3
+                    ? "Needs at least 3 songs"
+                    : "Waiting for song analysis to finish (BPM/key/energy)…"
+              }
+              className="border rounded px-4 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40"
+            >
+              {suggest.isPending
+                ? "Thinking…"
+                : !allAnalyzed && items.length >= 3
+                  ? "Suggest order (analyzing…)"
+                  : "Suggest order"}
+            </button>
+            <button
+              type="button"
+              onClick={() => lock.mutate()}
+              disabled={empty || lock.isPending}
+              className="border rounded px-4 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40"
+            >
+              {lock.isPending ? "Locking…" : "Done"}
+            </button>
+          </div>
         </div>
+
+        {suggest.error && (
+          <p className="text-sm text-amber-600 mb-2">
+            {(suggest.error as Error).message}
+          </p>
+        )}
+        {suggestion && (
+          <div className="border rounded p-3 mb-3 flex flex-col gap-2 bg-black/5 dark:bg-white/5">
+            {suggestion.improved ? (
+              <>
+                <p className="text-sm">
+                  Smoother order found — mix friction{" "}
+                  <span className="tabular-nums">
+                    {suggestion.current_cost} → {suggestion.suggested_cost}
+                  </span>
+                </p>
+                <ol className="text-xs opacity-80 flex flex-col gap-0.5">
+                  {suggestion.order.map((songId, i) => {
+                    const item = items.find(
+                      (it) => it.song.id === songId
+                    );
+                    const edge = i > 0 ? suggestion.edges[i - 1] : null;
+                    return (
+                      <li key={songId} className="truncate">
+                        {edge && (
+                          <span
+                            className={
+                              "mr-1 px-1 rounded text-[10px] " +
+                              (edge.grade === "A"
+                                ? "bg-emerald-500/30"
+                                : edge.grade === "B"
+                                  ? "bg-amber-500/30"
+                                  : "bg-red-500/30")
+                            }
+                            title={edge.reason}
+                          >
+                            {edge.grade}
+                          </span>
+                        )}
+                        {i + 1}. {item?.song.title ?? songId}
+                      </li>
+                    );
+                  })}
+                </ol>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={applySuggestion}
+                    className="border rounded px-3 py-1 text-sm hover:bg-black/5 dark:hover:bg-white/10"
+                  >
+                    Apply
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSuggestion(null)}
+                    className="border rounded px-3 py-1 text-sm opacity-70 hover:opacity-100"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm">
+                  Your order is already the smoothest path — nice crate.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setSuggestion(null)}
+                  className="border rounded px-3 py-1 text-sm opacity-70 hover:opacity-100"
+                >
+                  OK
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         {empty && (
           <p className="text-sm opacity-70">

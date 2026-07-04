@@ -149,7 +149,29 @@ export type Queue = {
   locked: boolean;
   created_at: string;
   locked_at: string | null;
+  occasion: string | null;
+  vibe_note: string | null;
+  arc_template: string | null;
+  tease_hooks: boolean;
+  host_frequency: string | null;
+  host_persona: string | null;
   items: QueueItem[];
+};
+
+export type QueueContextUpdate = {
+  occasion?: string | null;
+  vibe_note?: string | null;
+  arc_template?: string | null;
+  tease_hooks?: boolean;
+  host_frequency?: string | null;
+  host_persona?: string | null;
+};
+
+export type ContextOptions = {
+  occasions: { id: string; label: string; default_arc: string | null }[];
+  arcs: { id: string; label: string; description: string }[];
+  host_frequencies: string[];
+  host_personas: string[];
 };
 
 export type MixPlanStatus = "pending" | "rendering" | "ready" | "failed";
@@ -170,8 +192,28 @@ export type MixPlan = {
   style_hint: string | null;
   style_override: string | null;
   reroll_nonce: number;
+  qa_metrics: (Record<string, unknown> & { flags?: string[] }) | null;
+  qa_verdict: "pass" | "warn" | "fail" | null;
   created_at: string;
   updated_at: string;
+};
+
+export type OrderEdge = {
+  from_song_id: string;
+  to_song_id: string;
+  cost: number;
+  grade: "A" | "B" | "C";
+  reason: string;
+};
+
+export type OrderSuggestion = {
+  order: string[];
+  ordered_item_ids: string[];
+  edges: OrderEdge[];
+  current_edges: OrderEdge[];
+  current_cost: number;
+  suggested_cost: number;
+  improved: boolean;
 };
 
 export type TransitionStyleInfo = {
@@ -223,10 +265,18 @@ export type MixTimelineTransition = {
   reasoning: string | null;
 };
 
+export type MixTimelineHostEvent = {
+  slot: "intro" | "outro" | number;
+  start: number;
+  end: number;
+  text: string;
+};
+
 export type MixTimeline = {
   duration: number;
   songs: MixTimelineSong[];
   transitions: MixTimelineTransition[];
+  host?: MixTimelineHostEvent[];
 };
 
 export type QueueRender = {
@@ -291,6 +341,60 @@ export const api = {
     request<Queue>(`/api/queues/${queueId}/items`, {
       method: "PATCH",
       body: JSON.stringify({ ordered_item_ids: orderedItemIds }),
+    }),
+  suggestOrder: (queueId: string) =>
+    request<OrderSuggestion>(`/api/queues/${queueId}/suggest_order`, {
+      method: "POST",
+    }),
+  getContextOptions: () =>
+    request<ContextOptions>(`/api/queues/meta/context_options`),
+  setEnergyDial: (
+    queueId: string,
+    direction: "up" | "hold" | "down",
+    positionSeconds: number
+  ) =>
+    request<{ affected_transitions: number[]; direction: string }>(
+      `/api/queues/${queueId}/energy`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          direction,
+          position_seconds: positionSeconds,
+        }),
+      }
+    ),
+  sendTransitionFeedback: (
+    queueId: string,
+    fromSongId: string,
+    toSongId: string,
+    kind: "thumbs_up" | "thumbs_down"
+  ) =>
+    request<{ status: string }>(`/api/feedback`, {
+      method: "POST",
+      body: JSON.stringify({
+        queue_id: queueId,
+        from_song_id: fromSongId,
+        to_song_id: toSongId,
+        kind,
+      }),
+    }),
+  sendPlaybackEvent: (
+    queueId: string,
+    kind: "skip" | "replay",
+    positionSeconds: number
+  ) =>
+    request<{ status: string }>(`/api/feedback/playback`, {
+      method: "POST",
+      body: JSON.stringify({
+        queue_id: queueId,
+        kind,
+        position_seconds: positionSeconds,
+      }),
+    }),
+  updateQueueContext: (queueId: string, ctx: QueueContextUpdate) =>
+    request<Queue>(`/api/queues/${queueId}`, {
+      method: "PATCH",
+      body: JSON.stringify(ctx),
     }),
   lockQueue: (queueId: string) =>
     request<Queue>(`/api/queues/${queueId}/lock`, { method: "POST" }),
