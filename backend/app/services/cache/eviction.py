@@ -28,13 +28,29 @@ import logging
 from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import MixPlan, QueueItem, Song, SongStatus, Stems
+from app.models import MixPlan, QueueItem, QueueRender, Song, SongStatus, Stems
 from app.services.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
 
 # Prefixes the evictor will never delete from, no matter how stale.
 PROTECTED_PREFIXES: tuple[str, ...] = ("mix_plan_logs/",)
+
+# Prefixes the orphan sweep is allowed to delete from. Keys outside
+# these (e.g. a prefix added by future code before this list is
+# updated) are left alone rather than treated as orphans.
+SWEPT_PREFIXES: tuple[str, ...] = (
+    "audio/",
+    "stems/",
+    "stems_pitched/",
+    "mixes/",
+    "queue_mixes/",
+    "transcriptions/",
+)
+
+# Stem names mirrored from app.services.mixer.preshift (kept inline so
+# the evictor doesn't import the mixer stack).
+PITCHED_STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "other")
 
 # Song states where files are actively being written — exempt so a sweep
 # can't yank an audio/stem out from under a running worker.
@@ -67,7 +83,7 @@ def collect_song_storage_keys(song: Song, db: Session) -> list[str]:
             stems.drums_path,
             stems.bass_path,
             stems.other_path,
-            stems.vocal_envelope_path,
+            stems.envelopes_path,
         ):
             if k:
                 keys.append(k)
@@ -128,9 +144,58 @@ async def enforce_cache_budget(
         "total_before": total,
         "budget": budget_bytes,
         "evicted": [],
+        "orphans_deleted": 0,
         "freed": 0,
         "total_after": total,
     }
+
+    # Step 1: Mark-and-Sweep Garbage Collection
+    # Collect all deterministic keys that *could* exist for active DB rows.
+    # Anything in storage not matching these keys is an orphan and can be deleted.
+    valid_keys: set[str] = set()
+    for song_id, video_id in db.execute(select(Song.id, Song.youtube_video_id)):
+        valid_keys.add(f"audio/{video_id}.wav")
+        valid_keys.add(f"audio/{video_id}.opus")
+        valid_keys.add(f"audio/{video_id}.m4a")
+        valid_keys.add(f"transcriptions/{video_id}.json")
+        valid_keys.add(f"stems/{video_id}/vocals.wav")
+        valid_keys.add(f"stems/{video_id}/drums.wav")
+        valid_keys.add(f"stems/{video_id}/bass.wav")
+        valid_keys.add(f"stems/{video_id}/other.wav")
+        valid_keys.add(f"stems/{video_id}/envelopes.json")
+    for mix_plan_id in db.scalars(select(MixPlan.id)):
+        valid_keys.add(f"mixes/{mix_plan_id}.wav")
+        valid_keys.add(f"mixes/{mix_plan_id}.flac")
+    for queue_id in db.scalars(select(QueueRender.queue_id)):
+        valid_keys.add(f"queue_mixes/{queue_id}.m4a")
+        valid_keys.add(f"queue_mixes/{queue_id}.flac")
+        valid_keys.add(f"queue_mixes/{queue_id}.wav")
+    # Whole-song pitch-shifted stems (preshift.py cache). Keyed by the
+    # offset the set-level resolver assigned, so stale offsets from a
+    # re-resolved queue age out as orphans while live ones survive.
+    for song_id, offset in db.execute(
+        select(QueueItem.song_id, QueueItem.pitch_offset_semitones)
+    ):
+        if offset:
+            for name in PITCHED_STEM_NAMES:
+                valid_keys.add(f"stems_pitched/{song_id}/{offset:+d}/{name}.wav")
+
+    for key, size in list(sizes.items()):
+        if (
+            key.startswith(SWEPT_PREFIXES)
+            and not _is_protected(key)
+            and key not in valid_keys
+        ):
+            try:
+                await storage.delete(key)
+                total -= size
+                result["freed"] += size
+                result["orphans_deleted"] += 1
+                del sizes[key]
+            except Exception:
+                logger.warning(
+                    "enforce_cache_budget: failed to delete orphan %r", key, exc_info=True
+                )
     if total <= budget_bytes:
         return result
 

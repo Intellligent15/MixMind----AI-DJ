@@ -97,14 +97,14 @@ def test_collect_song_storage_keys(db_session):
             drums_path="stems/keys1/drums.wav",
             bass_path="stems/keys1/bass.wav",
             other_path="stems/keys1/other.wav",
-            vocal_envelope_path="stems/keys1/vocal_envelope.json",
+            envelopes_path="stems/keys1/envelopes.json",
         )
     )
     db.commit()
     keys = collect_song_storage_keys(song, db)
     assert "audio/keys1.wav" in keys
     assert "stems/keys1/vocals.wav" in keys
-    assert "stems/keys1/vocal_envelope.json" in keys
+    assert "stems/keys1/envelopes.json" in keys
     assert "transcriptions/keys1.json" in keys
 
 
@@ -203,3 +203,79 @@ def test_evicts_song_mix_plan_renders(db_session, storage):
 
     asyncio.run(enforce_cache_budget(db, storage, budget_bytes=0))
     assert asyncio.run(storage.exists("mixes/plan-a-b.wav")) is False
+
+
+def test_sweep_orphans_deleted(db_session, storage):
+    db = db_session
+    # A valid song that should NOT be deleted
+    song = _make_song(db, vid="valid", accessed_days_ago=1)
+    _write_song_blobs(storage, song, audio=1_000_000)
+    
+    # An orphan audio file
+    asyncio.run(storage.write("audio/orphan.wav", b"x" * 1_000_000))
+    # An orphan mix file
+    asyncio.run(storage.write("mixes/orphan-mix.wav", b"y" * 1_000_000))
+    # An orphan queue file
+    asyncio.run(storage.write("queue_mixes/orphan-queue.m4a", b"z" * 1_000_000))
+    
+    # Run enforce budget with a large budget so NO valid songs are evicted
+    # BUT the orphans should still be deleted
+    res = asyncio.run(enforce_cache_budget(db, storage, budget_bytes=10_000_000))
+    
+    assert res["orphans_deleted"] == 3
+    assert res["freed"] == 3_000_000
+    assert len(res["evicted"]) == 0
+    
+    assert asyncio.run(storage.exists("audio/orphan.wav")) is False
+    assert asyncio.run(storage.exists("mixes/orphan-mix.wav")) is False
+    assert asyncio.run(storage.exists("queue_mixes/orphan-queue.m4a")) is False
+    
+    # Valid song should remain
+    assert db.get(Song, song.id) is not None
+    assert asyncio.run(storage.exists("audio/valid.wav")) is True
+
+
+def test_sweep_keeps_pitched_stems_for_queued_offsets(db_session, storage):
+    """Preshift cache blobs matching a queue item's live pitch offset are
+    NOT orphans; blobs for stale offsets and unqueued songs are."""
+    db = db_session
+    song = _make_song(db, vid="pitched")
+    _write_song_blobs(storage, song, audio=1_000_000)
+    loose = _make_song(db, vid="loose")
+    _write_song_blobs(storage, loose, audio=1_000_000)
+
+    q = Queue(locked=True)
+    db.add(q)
+    db.commit()
+    db.add(
+        QueueItem(
+            queue_id=q.id, song_id=song.id, position=0,
+            pitch_offset_semitones=2,
+        )
+    )
+    db.commit()
+
+    live = f"stems_pitched/{song.id}/+2/vocals.wav"
+    stale = f"stems_pitched/{song.id}/-1/vocals.wav"   # offset re-resolved away
+    orphan = f"stems_pitched/{loose.id}/+1/vocals.wav"  # song not in any queue
+    for key in (live, stale, orphan):
+        asyncio.run(storage.write(key, b"p" * 1_000))
+
+    res = asyncio.run(enforce_cache_budget(db, storage, budget_bytes=50_000_000))
+
+    assert asyncio.run(storage.exists(live)) is True
+    assert asyncio.run(storage.exists(stale)) is False
+    assert asyncio.run(storage.exists(orphan)) is False
+    assert res["orphans_deleted"] == 2
+
+
+def test_sweep_leaves_unknown_prefixes_alone(db_session, storage):
+    """Keys outside the known artifact prefixes must never be swept —
+    a future key pattern must not be treated as an orphan."""
+    db = db_session
+    asyncio.run(storage.write("future_feature/blob.bin", b"f" * 1_000))
+
+    res = asyncio.run(enforce_cache_budget(db, storage, budget_bytes=50_000_000))
+
+    assert asyncio.run(storage.exists("future_feature/blob.bin")) is True
+    assert res["orphans_deleted"] == 0
