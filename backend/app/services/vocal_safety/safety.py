@@ -7,9 +7,11 @@ aligned-lyrics word boundaries against the vocal stem's frame-wise
 RMS + peak envelope written by ``separate_stems``.
 
 Envelope sidecar shape (written by
-``app/services/stems/service.py::_compute_vocal_envelope``):
-``{"frame_hz": int, "rms": [...], "peak": [...]}``. Legacy
-``hop_seconds`` key is also tolerated."""
+``app/services/stems/service.py::_compute_stem_envelopes``):
+``{"frame_hz": int, "vocals": {"rms": [...], "peak": [...]}, ...}``
+with one sub-dict per stem. Two legacy shapes are also tolerated:
+the flat vocal-only ``{"frame_hz": int, "rms": [...], "peak": [...]}``
+and the Modal-era ``{"hop_seconds": float, "rms": [...]}``."""
 
 from __future__ import annotations
 
@@ -26,6 +28,21 @@ def _hop_seconds(envelope: dict[str, Any]) -> float:
     if "hop_seconds" in envelope and envelope["hop_seconds"]:
         return float(envelope["hop_seconds"])
     return 0.1
+
+
+def _extract_vocal_envelope(
+    envelope: dict[str, Any],
+) -> tuple[list[float], list[float], float]:
+    """Vocal ``(rms, peak, hop_seconds)`` from any known sidecar shape.
+
+    Accepts the current multi-stem schema (vocal data nested under
+    ``"vocals"``) and both legacy flat shapes (rms/peak at the top
+    level) still present on Stems rows separated before the rename."""
+    vocals = envelope.get("vocals")
+    source = vocals if isinstance(vocals, dict) else envelope
+    rms = list(source.get("rms") or [])
+    peak = list(source.get("peak") or [])
+    return rms, peak, _hop_seconds(envelope)
 
 
 def _envelope_value(values: list[float], idx: int) -> float:
@@ -250,9 +267,7 @@ def vocal_safe_regions(
     duration_seconds: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Returns ``[{"start", "end", "safe", "reason"}, ...]``."""
-    rms_list: list[float] = list(envelope.get("rms") or [])
-    peak_list: list[float] = list(envelope.get("peak") or [])
-    hop = _hop_seconds(envelope)
+    rms_list, peak_list, hop = _extract_vocal_envelope(envelope)
 
     if not rms_list:
         return [{

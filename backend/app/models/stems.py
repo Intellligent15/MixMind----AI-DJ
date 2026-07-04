@@ -47,11 +47,12 @@ class Stems(Base):
     # decision reads this instead of re-loading the vocal stem.
     vocal_rms: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    # Storage key for the frame-wise RMS+peak envelope sidecar (10 Hz JSON).
-    # Null on Stems rows that pre-date this column — re-separate to populate.
-    # Schema lives in services/stems/service.py::_compute_vocal_envelope.
-    # Consumed by the Vocal Safety service (planned before Phase 9).
-    vocal_envelope_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Storage key for the frame-wise per-stem RMS+peak envelope sidecar
+    # (10 Hz JSON). Null on Stems rows that pre-date this column —
+    # re-separate to populate.
+    # Schema lives in services/stems/service.py::_compute_stem_envelopes.
+    # Consumed by the Vocal Safety service and the seam-candidate builder.
+    envelopes_path: Mapped[str | None] = mapped_column(String, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

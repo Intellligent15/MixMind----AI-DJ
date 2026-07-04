@@ -16,8 +16,8 @@ import torch
 
 from app.services.stems import STEM_NAMES, StemSeparationService
 from app.services.stems.service import (
-    VOCAL_ENVELOPE_FRAME_HZ,
-    _compute_vocal_envelope,
+    ENVELOPES_FRAME_HZ,
+    _compute_stem_envelopes,
 )
 
 
@@ -120,7 +120,7 @@ def test_separate_silent_vocals_has_zero_rms():
     assert result.vocal_rms == 0.0
 
 
-def test_separate_emits_vocal_envelope_shape():
+def test_separate_emits_envelopes_shape():
     """End-to-end: separate() returns an envelope with matching rms/peak lengths
     and a frame_hz tag at the module-level rate."""
     model, _ = _make_stub_model(sample_rate=4410)  # 4410/10 = 441-sample frames
@@ -146,29 +146,30 @@ def test_separate_emits_vocal_envelope_shape():
     ):
         result = svc.separate(Path("/fake/audio.wav"))
 
-    env = result.vocal_envelope
-    assert env["frame_hz"] == VOCAL_ENVELOPE_FRAME_HZ
-    assert len(env["rms"]) == len(env["peak"]) == 12
+    env = result.envelopes
+    assert env["frame_hz"] == ENVELOPES_FRAME_HZ
+    assert len(env["vocals"]["rms"]) == len(env["vocals"]["peak"]) == 12
     # Constant 0.1 amplitude → rms == peak == 0.1 per frame.
-    assert all(abs(v - 0.1) < 1e-6 for v in env["rms"])
-    assert all(abs(v - 0.1) < 1e-6 for v in env["peak"])
+    assert all(abs(v - 0.1) < 1e-6 for v in env["vocals"]["rms"])
+    assert all(abs(v - 0.1) < 1e-6 for v in env["vocals"]["peak"])
 
 
-def test_compute_vocal_envelope_drops_trailing_partial_frame():
+def test_compute_envelopes_drops_trailing_partial_frame():
     sample_rate = 100
     frame_hz = 10  # frame_size = 10 samples
     # 25 samples → 2 full frames, 5-sample tail that should be dropped.
-    vocals = torch.ones(2, 25) * 0.5
-    env = _compute_vocal_envelope(vocals, sample_rate, frame_hz)
+    stems = {"vocals": torch.ones(2, 25) * 0.5}
+    env = _compute_stem_envelopes(stems, sample_rate, frame_hz)
     assert env["frame_hz"] == 10
-    assert len(env["rms"]) == 2
-    assert len(env["peak"]) == 2
+    assert len(env["vocals"]["rms"]) == 2
+    assert len(env["vocals"]["peak"]) == 2
 
 
-def test_compute_vocal_envelope_empty_when_shorter_than_one_frame():
+def test_compute_envelopes_empty_when_shorter_than_one_frame():
     # 5 samples at sample_rate=100, frame_hz=10 → frame_size=10 → no full frames.
-    env = _compute_vocal_envelope(torch.ones(1, 5), 100, 10)
-    assert env == {"frame_hz": 10, "rms": [], "peak": []}
+    stems = {"vocals": torch.ones(1, 5)}
+    env = _compute_stem_envelopes(stems, 100, 10)
+    assert env == {"frame_hz": 10, "vocals": {"rms": [], "peak": []}}
 
 
 def test_write_stem_persists_wav(tmp_path: Path):

@@ -20,6 +20,6 @@ class StemsRead(BaseModel):
     bass_path: str | None
     other_path: str | None
     vocal_rms: float | None
-    vocal_envelope_path: str | None
+    envelopes_path: str | None
     created_at: datetime
     updated_at: datetime

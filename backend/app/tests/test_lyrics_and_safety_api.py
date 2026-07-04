@@ -91,7 +91,7 @@ def test_get_lyrics_returns_row(db_session: Session):
 
 
 def _seed_stems_with_envelope(db: Session, s: Song, env: dict) -> Stems:
-    key = f"stems/{s.youtube_video_id}/vocal_envelope.json"
+    key = f"stems/{s.youtube_video_id}/envelopes.json"
     asyncio.run(get_storage().write(key, json.dumps(env).encode()))
     stems = Stems(
         song_id=s.id,
@@ -102,7 +102,7 @@ def _seed_stems_with_envelope(db: Session, s: Song, env: dict) -> Stems:
         bass_path=f"stems/{s.youtube_video_id}/bass.wav",
         other_path=f"stems/{s.youtube_video_id}/other.wav",
         vocal_rms=0.15,
-        vocal_envelope_path=key,
+        envelopes_path=key,
     )
     db.add(stems); db.flush()
     return stems

@@ -183,3 +183,65 @@ def test_quiet_pocket_inside_noisy_gap_is_surfaced():
     # No region bleeds into the loud 6–30 s break, and none spans the whole tail.
     assert not any(r["start"] < 28.0 and r["end"] > 8.0 for r in out), out
     assert all((r["end"] - r["start"]) < 54.0 for r in out), out
+
+
+# ---- envelope sidecar schema compatibility ----------------------------------
+# Three shapes exist in storage: the current multi-stem schema written by
+# _compute_stem_envelopes, the flat vocal-only legacy shape, and the
+# Modal-era {"hop_seconds", "rms"} shape (no peak).
+
+
+def _nested_envelope(frame_hz: int, rms: list[float], peak: list[float] | None = None) -> dict:
+    return {
+        "frame_hz": frame_hz,
+        "vocals": {
+            "rms": rms,
+            "peak": peak if peak is not None else [r * 1.5 for r in rms],
+        },
+        # Other stems must be ignored by vocal safety even when loud.
+        "drums": {"rms": [0.5] * len(rms), "peak": [0.9] * len(rms)},
+        "bass": {"rms": [0.5] * len(rms), "peak": [0.9] * len(rms)},
+        "other": {"rms": [0.5] * len(rms), "peak": [0.9] * len(rms)},
+    }
+
+
+def test_nested_schema_reads_vocal_stem():
+    """Regression: the multi-stem schema must not read as "no envelope"
+    (which marks the entire song safe)."""
+    env = _nested_envelope(10, rms=[0.001] * 100)
+    out = vocal_safe_regions(
+        transcription_segments=[],
+        envelope=env,
+        duration_seconds=10.0,
+    )
+    assert len(out) == 1
+    assert out[0]["reason"] != "no_envelope"
+    assert out[0]["start"] == 0.0
+    assert abs(out[0]["end"] - 10.0) < 0.2
+
+
+def test_nested_schema_hot_vocals_block_regions():
+    """Loud vocals in the nested schema must block, exactly as flat does."""
+    rms = [0.05] * 100  # vocals hot the whole way through
+    flat = vocal_safe_regions(
+        transcription_segments=[], envelope=_envelope(10, rms),
+        duration_seconds=10.0,
+    )
+    nested = vocal_safe_regions(
+        transcription_segments=[], envelope=_nested_envelope(10, rms),
+        duration_seconds=10.0,
+    )
+    assert nested == flat
+    assert nested == []
+
+
+def test_modal_legacy_hop_seconds_shape():
+    """The Modal-era {"hop_seconds", "rms"} sidecar (no peak) still works."""
+    env = {"hop_seconds": 0.1, "rms": [0.001] * 100}
+    out = vocal_safe_regions(
+        transcription_segments=[],
+        envelope=env,
+        duration_seconds=10.0,
+    )
+    assert len(out) == 1
+    assert out[0]["reason"] != "no_envelope"

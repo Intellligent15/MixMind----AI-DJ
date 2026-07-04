@@ -40,7 +40,7 @@ def _stem_key(video_id: str, stem: str) -> str:
 
 
 def _envelope_key(video_id: str) -> str:
-    return f"stems/{video_id}/vocal_envelope.json"
+    return f"stems/{video_id}/envelopes.json"
 
 
 def _separate_via_modal(audio_key: str, video_id: str) -> dict:
@@ -133,7 +133,7 @@ def separate_stems(song_id: str) -> str | None:
                     "bass": result["bass_path"],
                     "other": result["other_path"],
                 }
-                envelope_key = result["vocal_envelope_path"]
+                envelope_key = result["envelopes_path"]
                 vocal_rms = result["vocal_rms"]
                 model_name = result["model_name"]
             else:
@@ -154,8 +154,8 @@ def separate_stems(song_id: str) -> str | None:
                     keys[stem_name] = key
 
                 envelope_key = _envelope_key(video_id)
-                envelope_dest = Path(tmpdir) / "vocal_envelope.json"
-                envelope_dest.write_text(json.dumps(result.vocal_envelope))
+                envelope_dest = Path(tmpdir) / "envelopes.json"
+                envelope_dest.write_text(json.dumps(result.envelopes))
                 asyncio.run(storage.upload_file(envelope_dest, envelope_key))
                 vocal_rms = result.vocal_rms
                 model_name = service.model_name
@@ -189,7 +189,7 @@ def separate_stems(song_id: str) -> str | None:
             bass_path=keys["bass"],
             other_path=keys["other"],
             vocal_rms=vocal_rms,
-            vocal_envelope_path=envelope_key,
+            envelopes_path=envelope_key,
         )
         db.add(stems_row)
         song = db.get(Song, song_uuid)
