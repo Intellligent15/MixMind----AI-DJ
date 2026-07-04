@@ -20,6 +20,7 @@ import pyrubberband.pyrb as pyrb
 import soundfile as sf
 from scipy.signal import fftconvolve, iirfilter, sosfilt, sosfilt_zi
 
+from app.services.mixer.tempo_map import map_sample, ramp_time_map
 from app.services.mixer.types import (
     AnalysisBundle,
     MixerPreconditionError,
@@ -60,6 +61,12 @@ LOOP_XFADE_MS = 5.0
 # swap_stem: search window for a matched zero-crossing on either side of
 # the requested swap time, in milliseconds.
 SWAP_ZC_SEARCH_MS = 5.0
+# apply_reverb: the wet/dry mix ramps from 0 to wet_level over this many
+# bars instead of switching instantly. A hard switch steps the dry signal
+# down by (1 - wet_level) — -14 dB at wet_level 0.8 — in one sample: an
+# audible click plus a sudden volume drop at the effect onset. One bar
+# reads as a DJ bringing the reverb send up.
+REVERB_WET_RAMP_BARS = 1.0
 
 # Pair-phase alignment (render-time downbeat correction). Per-song downbeat
 # detection can still mis-call one track's bar-1; aligning A's seam downbeat to
@@ -334,7 +341,13 @@ def _apply_filter_sweep(audio: np.ndarray, call: dict) -> np.ndarray:
             FILTER_SWEEP_ORDER, wn, btype=btype, ftype="butter", output="sos"
         )
         if zi_per_channel is None:
-            zi_per_channel = [sosfilt_zi(sos) for _ in range(window.shape[1])]
+            # sosfilt_zi returns the steady state for a UNIT STEP input;
+            # scale it to the actual first sample or the filter starts as
+            # if the signal had been pinned at DC 1.0 — an audible click
+            # at the sweep onset.
+            zi_per_channel = [
+                sosfilt_zi(sos) * window[0, ch] for ch in range(window.shape[1])
+            ]
         block_start = i * block_samples
         block_end = min(block_start + block_samples, n)
         chunk = window[block_start:block_end]
@@ -382,7 +395,11 @@ def _apply_echo_out(audio: np.ndarray, call: dict) -> np.ndarray:
 
 
 def _apply_reverb(audio: np.ndarray, call: dict) -> np.ndarray:
-    """Wash-out reverb using FFT convolution with decaying noise."""
+    """Wash-out reverb using FFT convolution with decaying noise.
+
+    The wet/dry mix ramps from fully dry to `wet_level` over
+    REVERB_WET_RAMP_BARS so the onset is a swell, not a step (see the
+    constant's comment)."""
     bpm = float(call.get("bpm", 0.0))
     tail_bars = float(call.get("tail_duration_bars", 0.0))
     wet_level = float(call.get("wet_level", 0.0))
@@ -411,9 +428,126 @@ def _apply_reverb(audio: np.ndarray, call: dict) -> np.ndarray:
     wet = np.empty_like(dry)
     for ch in range(REQUIRED_CHANNELS):
         wet[:, ch] = fftconvolve(dry[:, ch], ir[:, ch], mode='full')[:dry.shape[0]]
-        
+
+    ramp_len = min(
+        int(REVERB_WET_RAMP_BARS * (60.0 / bpm) * 4.0 * REQUIRED_SAMPLE_RATE),
+        dry.shape[0],
+    )
+    mix = np.full(dry.shape[0], wet_level, dtype=np.float32)
+    if ramp_len > 0:
+        mix[:ramp_len] = np.linspace(
+            0.0, wet_level, ramp_len, endpoint=False, dtype=np.float32
+        )
+    mix = mix[:, None]
+
     out = audio.copy()
-    out[start_samp:] = dry * (1.0 - wet_level) + wet * wet_level
+    out[start_samp:] = dry * (1.0 - mix) + wet * mix
+    return out
+
+
+# vocal_tease: edge fades on the teased hook and duck depth for A's
+# melodic stem while the foreign vocal rides.
+TEASE_EDGE_FADE_S = 0.05
+TEASE_DUCK_GAIN = 0.65
+
+
+def _apply_vocal_tease(
+    a_stems: dict[str, np.ndarray], b_vocal: np.ndarray, call: dict
+) -> None:
+    """Drop a slice of B's vocal hook onto A's timeline (in place).
+
+    The hook is time-stretched to A's tempo (bpm_from -> bpm_to), pitch-
+    shifted into A's key when requested, edge-faded, and ADDED to A's
+    vocal stem at start_time; A's "other" stem ducks underneath so two
+    melodies never fight the riding line. All positions are A-original
+    time (pre any meet-in-the-middle stretch), so the tease moves with
+    A's map like every other pre-fx.
+    """
+    start = int(float(call.get("start_time", 0.0)) * REQUIRED_SAMPLE_RATE)
+    h0 = int(float(call.get("hook_start", 0.0)) * REQUIRED_SAMPLE_RATE)
+    h1 = int(float(call.get("hook_end", 0.0)) * REQUIRED_SAMPLE_RATE)
+    h0 = max(0, min(h0, b_vocal.shape[0]))
+    h1 = max(h0, min(h1, b_vocal.shape[0]))
+    a_vocals = a_stems["vocals"]
+    if h1 <= h0 or start < 0 or start >= a_vocals.shape[0]:
+        return
+
+    clip = np.array(b_vocal[h0:h1], dtype=np.float32)
+    bpm_from = float(call.get("bpm_from") or 0.0)
+    bpm_to = float(call.get("bpm_to") or 0.0)
+    if bpm_from > 0 and bpm_to > 0 and abs(bpm_to - bpm_from) / bpm_from > 1e-3:
+        clip = np.asarray(
+            pyrb.time_stretch(clip, REQUIRED_SAMPLE_RATE, bpm_to / bpm_from),
+            dtype=np.float32,
+        )
+    semitones = int(call.get("semitones") or 0)
+    if semitones:
+        clip = np.asarray(
+            pyrb.pitch_shift(clip, REQUIRED_SAMPLE_RATE, semitones),
+            dtype=np.float32,
+        )
+
+    gain = float(call.get("gain", 0.9))
+    fade = min(int(TEASE_EDGE_FADE_S * REQUIRED_SAMPLE_RATE), clip.shape[0] // 2)
+    if fade > 0:
+        clip[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
+        clip[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)[:, None]
+
+    end = min(start + clip.shape[0], a_vocals.shape[0])
+    usable = end - start
+    if usable <= 0:
+        return
+    a_vocals[start:end] += gain * clip[:usable]
+
+    # Duck A's melodic stem under the riding hook, with soft edges.
+    other = a_stems["other"]
+    duck_env = np.full(usable, TEASE_DUCK_GAIN, dtype=np.float32)
+    edge = min(fade, usable // 2)
+    if edge > 0:
+        duck_env[:edge] = np.linspace(1.0, TEASE_DUCK_GAIN, edge, dtype=np.float32)
+        duck_env[-edge:] = np.linspace(TEASE_DUCK_GAIN, 1.0, edge, dtype=np.float32)
+    other[start:end] *= duck_env[:, None]
+
+
+def _apply_backspin(audio: np.ndarray, call: dict) -> np.ndarray:
+    """The rewind: the audio just before start_time plays REVERSED with
+    accelerating speed (like yanking a record backwards), then hard
+    silence — the incoming song drops clean at the cut.
+
+    The reversed source is `duration_beats` of audio leading up to
+    start_time; the spin occupies ~60% of that (acceleration eats the
+    rest), ending in a 5 ms fade so the cut never clicks.
+    """
+    bpm = float(call.get("bpm", 0.0))
+    beats = float(call.get("duration_beats", 0.0))
+    if bpm <= 0 or beats <= 0:
+        return audio
+    start_samp = max(0, min(int(float(call.get("start_time", 0.0)) * REQUIRED_SAMPLE_RATE),
+                            audio.shape[0]))
+    src_len = int(beats * (60.0 / bpm) * REQUIRED_SAMPLE_RATE)
+    if src_len <= 0 or start_samp < src_len or start_samp >= audio.shape[0]:
+        return audio
+
+    src = audio[start_samp - src_len: start_samp][::-1]
+    out_len = min(max(1, int(src_len * 0.6)), audio.shape[0] - start_samp)
+
+    # Quadratic phase: rate starts at 1.0 and accelerates so the whole
+    # reversed slice is consumed in out_len samples.
+    t = np.arange(out_len, dtype=np.float64)
+    alpha = max(0.0, (src_len - out_len) / max(1.0, float(out_len) ** 2))
+    phase = t * (1.0 + alpha * t)
+    phase = np.clip(phase, 0, src_len - 1)
+
+    out = audio.copy()
+    spun = np.empty((out_len, audio.shape[1]), dtype=audio.dtype)
+    src_idx = np.arange(src_len, dtype=np.float64)
+    for ch in range(audio.shape[1]):
+        spun[:, ch] = np.interp(phase, src_idx, src[:, ch].astype(np.float64))
+    fade = min(int(0.005 * REQUIRED_SAMPLE_RATE), out_len)
+    if fade > 0:
+        spun[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)[:, None]
+    out[start_samp: start_samp + out_len] = spun
+    out[start_samp + out_len:] = 0.0
     return out
 
 
@@ -612,7 +746,8 @@ def render(
     stem_calls: list[dict] = []
     perm_pitch = None
     temp_pitch = None
-    tempo_ramp = None
+    tempo_ramp = None       # B-side: post-crossfade glide to native tempo
+    a_tempo_ramp = None     # A-side: pre-seam meet-in-the-middle ramp
     # Per-song effects in original time; applied before the stretch / crossfade.
     pre_fx: list[dict] = []
     # Output-time effects (swap_stem); applied after the crossfade is laid down.
@@ -627,10 +762,13 @@ def render(
         elif tool == "temporary_pitch_shift":
             temp_pitch = call
         elif tool == "set_tempo_ramp":
-            tempo_ramp = call
+            if call.get("song") == "A":
+                a_tempo_ramp = call
+            else:
+                tempo_ramp = call
         elif tool == "crossfade_stem":
             stem_calls.append(call)
-        elif tool in ("filter_sweep", "echo_out", "loop_section", "apply_reverb", "turntable_stop", "volume_fade"):
+        elif tool in ("filter_sweep", "echo_out", "loop_section", "apply_reverb", "turntable_stop", "backspin", "volume_fade", "vocal_tease"):
             pre_fx.append(call)
         elif tool == "swap_stem":
             post_fx.append(call)
@@ -645,17 +783,27 @@ def render(
     #     are linear or near-linear; applying per-stem and resumming gives
     #     the same result as applying to the sum, but keeps the per-stem
     #     paths (a_stems / b_stems_raw) available for the crossfade region.
+    a_fx_start: int | None = None  # earliest A-side fx onset, in samples
+    b_had_fx = False
     for fx in pre_fx:
         song = fx["song"]
         tool = fx["tool"]
+        if tool == "vocal_tease":
+            # Cross-song effect: B's vocal hook rides on A's timeline.
+            _apply_vocal_tease(a_stems, b_stems_raw["vocals"], fx)
+            onset = max(0, int(float(fx.get("start_time", 0.0)) * REQUIRED_SAMPLE_RATE))
+            a_fx_start = onset if a_fx_start is None else min(a_fx_start, onset)
+            continue
         target = a_stems if song == "A" else b_stems_raw
-        # volume_fade may target a single stem (true EQ-kill, e.g. drop A's
-        # bass early); every other pre-fx applies to the whole song. An
+        # volume_fade and filter_sweep may target a single stem (true
+        # EQ-kill / EQ-sweep, e.g. drop A's bass early or high-pass just
+        # the bass out); every other pre-fx applies to the whole song. An
         # invalid/absent stem falls back to all four.
         fx_stem = fx.get("stem")
         names = (
             (fx_stem,)
-            if tool == "volume_fade" and fx_stem in ("vocals", "drums", "bass", "other")
+            if tool in ("volume_fade", "filter_sweep")
+            and fx_stem in ("vocals", "drums", "bass", "other")
             else ("vocals", "drums", "bass", "other")
         )
         for name in names:
@@ -669,19 +817,91 @@ def render(
                 target[name] = _apply_reverb(target[name], fx)
             elif tool == "turntable_stop":
                 target[name] = _apply_turntable_stop(target[name], fx)
+            elif tool == "backspin":
+                target[name] = _apply_backspin(target[name], fx)
             elif tool == "volume_fade":
                 target[name] = _apply_volume_fade(target[name], fx)
         if song == "A":
-            a_mix = _stems_sum(a_stems)
+            onset = max(0, int(float(fx.get("start_time", 0.0)) * REQUIRED_SAMPLE_RATE))
+            a_fx_start = onset if a_fx_start is None else min(a_fx_start, onset)
         else:
-            b_vocal = b_stems_raw["vocals"]
-            b_instr = b_stems_raw["drums"] + b_stems_raw["bass"] + b_stems_raw["other"]
-            b_mix = b_vocal + b_instr
+            b_had_fx = True
+
+    if a_fx_start is not None:
+        # A's summed mix is only read before the seam (plus the pair-phase
+        # window); the crossfade region reads a_stems directly. So keep the
+        # untouched master up to the first effect's onset and splice the
+        # processed stem-sum in over a short equal-power fade — replacing
+        # the whole buffer would serve the Demucs reconstruction for all of
+        # A's pre-seam body just because the transition has an effect.
+        processed = _stems_sum(a_stems)
+        blended = a_mix.copy()
+        n_blend = min(blended.shape[0], processed.shape[0])
+        switch = min(a_fx_start, n_blend)
+        xf = min(int(0.020 * REQUIRED_SAMPLE_RATE), switch)
+        if xf > 0:
+            # Ends AT the onset, so the effect starts on a fully-processed
+            # path; before the onset the two signals carry the same content
+            # (master vs stem reconstruction), so a 20 ms fade is inaudible.
+            t = np.linspace(0.0, 1.0, xf, endpoint=False, dtype=np.float32)[:, None]
+            blended[switch - xf : switch] = (
+                np.cos(t * (np.pi / 2.0)) * blended[switch - xf : switch]
+                + np.sin(t * (np.pi / 2.0)) * processed[switch - xf : switch]
+            )
+        blended[switch:n_blend] = processed[switch:n_blend]
+        a_mix = blended
+    if b_had_fx:
+        b_vocal = b_stems_raw["vocals"]
+        b_instr = b_stems_raw["drums"] + b_stems_raw["bass"] + b_stems_raw["other"]
+        b_mix = b_vocal + b_instr
+
+    # 2c. Tempo meet-in-the-middle: an A-side ramp means A glides to the
+    #     meet tempo over its last bars before the seam, so the crossfade
+    #     runs at mid-tempo and B only stretches the other half of the
+    #     gap. A's stems and master all go through the same time map;
+    #     A-timeline positions at/after the ramp must be translated via
+    #     _a_out_sample() from here on.
+    a_meet_bpm = a.analysis.bpm
+    a_time_pairs: list[tuple[int, int]] | None = None
+    if a_tempo_ramp and a.analysis.bpm:
+        end_bpm = float(a_tempo_ramp.get("end_bpm") or a.analysis.bpm)
+        a_rate_after = end_bpm / a.analysis.bpm
+        if abs(1.0 - a_rate_after) > 1e-6:
+            a_meet_bpm = end_bpm
+            ramp_start = int(float(a_tempo_ramp.get("start_time", 0.0)) * REQUIRED_SAMPLE_RATE)
+            ramp_end = int(float(a_tempo_ramp.get("end_time", 0.0)) * REQUIRED_SAMPLE_RATE)
+            a_time_pairs = ramp_time_map(
+                a_mix.shape[0], ramp_start, ramp_end, 1.0, a_rate_after
+            )
+
+            def _stretch_a(audio: np.ndarray) -> np.ndarray:
+                pairs = ramp_time_map(
+                    audio.shape[0], ramp_start, ramp_end, 1.0, a_rate_after
+                )
+                return np.asarray(
+                    pyrb.timemap_stretch(audio, REQUIRED_SAMPLE_RATE, pairs),
+                    dtype=np.float32,
+                )
+
+            a_stems = {name: _stretch_a(arr) for name, arr in a_stems.items()}
+            a_mix = _stretch_a(a_mix)
+
+    def _a_out_sample(src_samp: float) -> int:
+        """A original-timeline sample -> output sample (identity unless
+        the meet-in-the-middle ramp stretched A)."""
+        if a_time_pairs is None:
+            return int(round(src_samp))
+        return map_sample(a_time_pairs, src_samp)
 
     # 3. Build B's time-stretch once, apply on demand. The map depends only
     #    on sample positions (not content), so the same stretch applies to
     #    the full mix or to the vocal / instrumental split.
-    rate_A = a.analysis.bpm / b.analysis.bpm  # rubberband rate convention
+    #    tempo_ratio (window, default 1.0) is the half/double-time trick:
+    #    B is beatmatched toward a.bpm * ratio so 85 <-> 170 BPM pairs
+    #    interlock at 2:1 instead of suffering a 2x stretch. With a
+    #    meet-in-the-middle ramp the crossfade tempo is a_meet_bpm.
+    tempo_ratio = float(window.get("tempo_ratio") or 1.0)
+    rate_A = (a_meet_bpm * tempo_ratio) / b.analysis.bpm
     stretch_factor = 1.0 / rate_A             # how much longer B becomes
     b_total = b_mix.shape[0]
 
@@ -909,10 +1129,14 @@ def render(
     )
     b_seam_post = b_seam_orig * stretch_factor
 
-    a_seam_sample = int(round(a_seam * REQUIRED_SAMPLE_RATE))
+    # The seam in OUTPUT samples: identity unless the meet-in-the-middle
+    # ramp stretched A's tail (then the map translates it).
+    a_seam_sample = _a_out_sample(a_seam * REQUIRED_SAMPLE_RATE)
     b_seam_sample = int(round(b_seam_post * REQUIRED_SAMPLE_RATE))
 
-    sec_per_bar_a = (60.0 / a.analysis.bpm) * a.analysis.time_signature
+    # Bars inside/after the window run at the crossfade tempo — A's
+    # native bpm normally, the meet tempo when an A-ramp is present.
+    sec_per_bar_a = (60.0 / a_meet_bpm) * a.analysis.time_signature
     samples_per_bar_a = sec_per_bar_a * REQUIRED_SAMPLE_RATE
 
     # 4c. Pair-phase correction. A's and B's downbeats are aligned at the seam,

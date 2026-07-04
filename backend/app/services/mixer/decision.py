@@ -30,6 +30,9 @@ class TransitionStyle(str, enum.Enum):
     vinyl_stop = "vinyl_stop"
     acapella_out = "acapella_out"
     acapella_in = "acapella_in"
+    double_drop = "double_drop"
+    backspin = "backspin"
+    breakdown_blend = "breakdown_blend"
 
 
 class TransitionExtra(str, enum.Enum):
@@ -52,6 +55,9 @@ STYLE_DURATION_CHOICES: dict[TransitionStyle, tuple[int, ...]] = {
     TransitionStyle.vinyl_stop: (2, 4),
     TransitionStyle.acapella_out: (8, 12, 16),
     TransitionStyle.acapella_in: (8, 12, 16),
+    TransitionStyle.double_drop: (8,),
+    TransitionStyle.backspin: (2, 4),
+    TransitionStyle.breakdown_blend: (16,),
 }
 
 STYLE_DESCRIPTIONS: dict[TransitionStyle, str] = {
@@ -78,20 +84,45 @@ STYLE_DESCRIPTIONS: dict[TransitionStyle, str] = {
     ),
     TransitionStyle.vinyl_stop: (
         "A grinds to a halt like a turntable being stopped, then B starts "
-        "fresh. The escape hatch for incompatible tempos or total vibe "
-        "changes — use sparingly, it's theatrical."
+        "fresh. STRICTLY a last resort for pairs that cannot blend at all "
+        "(unbridgeable tempo gap or unmatchable keys) — never pick it for "
+        "a pair that could crossfade, and at most once per set."
     ),
     TransitionStyle.acapella_out: (
         "B's instrumental takes over fast at the seam while A's VOCALS keep "
         "riding on top of B's new beat, then hand over to B's vocals at a "
         "phrase boundary. Spine-tingling when A has an iconic vocal and B "
-        "is groove-led. REQUIRES compatible keys — never pick on a clash."
+        "is groove-led. Keys need NOT be identical — any standard Camelot "
+        "match works (same code, relative major/minor, or ±1 on the wheel); "
+        "never pick on a true clash."
     ),
     TransitionStyle.acapella_in: (
         "B's VOCALS arrive immediately over A's still-playing backing track "
         "(a teaser), then A's instrumental swaps to B's later. Great when "
-        "B's hook is instantly recognizable. REQUIRES compatible keys — "
-        "never pick on a clash — and a vocal-safe OUT point on A."
+        "B's hook is instantly recognizable. Keys need NOT be identical — "
+        "any standard Camelot match works (same code, relative major/minor, "
+        "or ±1 on the wheel); never pick on a true clash. Also needs a "
+        "vocal-safe OUT point on A."
+    ),
+    TransitionStyle.double_drop: (
+        "Both songs' drops hit the SAME downbeat — the crowd-scream move. "
+        "Pick a high-energy OUT on A (its drop/chorus) and a high-energy IN "
+        "on B (its drop); both play together before A bows out. ONLY when "
+        "keys are Camelot-compatible, the tempo gap is small, and both "
+        "candidates have energy >= 0.8. At most once per set."
+    ),
+    TransitionStyle.backspin: (
+        "A's last bar spins backwards with accelerating speed into a hard "
+        "cut, then B drops clean. Theatrical, hip-hop / open-format flavor "
+        "— the rewind. Use sparingly (at most once per set), best with a "
+        "vocal-safe OUT and a high-energy IN on B."
+    ),
+    TransitionStyle.breakdown_blend: (
+        "The invisible transition: blend during BOTH songs' quiet stretches "
+        "— A's final breakdown/outro dissolves into B's intro or breakdown "
+        "over a long window, and the listener only notices the swap when "
+        "B's energy returns. Pick a LOW-energy OUT on A and a low-energy "
+        "IN on B."
     ),
 }
 
@@ -111,6 +142,10 @@ class TransitionDecision(BaseModel):
         "Omit for a fully coupled crossfade.",
     )
     extras: list[TransitionExtra] = Field(default_factory=list)
+    # Hook teasing (opt-in per queue): when true, B's vocal hook is teased
+    # over an instrumental pocket late in A, minutes before the seam. The
+    # placement is computed deterministically; the LLM only opts in.
+    tease: bool = False
     rationale: str = Field(default="", max_length=600)
 
     @field_validator("extras")

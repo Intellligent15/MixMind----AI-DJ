@@ -30,6 +30,7 @@ from app.services.mixer.archetypes import (
     camelot_compatible,
     default_decision,
     expand,
+    halftime_ratio,
 )
 from app.services.mixer.candidates import (
     PairCandidates,
@@ -70,7 +71,7 @@ class PlanOutcome:
 
 def _song_llm_input(meta: SongMeta, candidates: list) -> dict:
     b = effective_bundle(meta.bundle, meta.pitch_offset)
-    return {
+    out = {
         "title": meta.title,
         "artist": meta.artist,
         "bpm": b.bpm,
@@ -80,6 +81,9 @@ def _song_llm_input(meta: SongMeta, candidates: list) -> dict:
         "sections": enrich_sections(b.sections, meta.energy_curve)[:12],
         "candidates": [c.to_llm_dict() for c in candidates],
     }
+    if b.tags:
+        out["tags"] = b.tags
+    return out
 
 
 def _pair_facts(
@@ -90,7 +94,11 @@ def _pair_facts(
     )
     compatible = camelot_compatible(a.camelot_key, b.camelot_key)
     if compatible:
-        key_verdict = "compatible — no pitch handling needed"
+        key_verdict = (
+            "compatible under the standard Camelot rule (same code, relative "
+            "major/minor, or adjacent on the wheel) — no pitch handling "
+            "needed; acapella styles are fair game even if the keys differ"
+        )
     elif pitch_mode == "temporary":
         try:
             delta = compute_pitch_shift(a.key, b.key)
@@ -109,11 +117,22 @@ def _pair_facts(
             "washy transition (drop_swap, wash_out, vinyl_stop, or a short "
             "stutter_buildup) and avoid long melodic blends"
         )
-    return {
+    facts = {
         "tempo_gap_percent": tempo_gap_pct,
         "tempo_note": "B is beatmatched to A automatically; ignore tempo math",
         "key_verdict": key_verdict,
     }
+    if (
+        a.bpm and b.bpm
+        and tempo_gap_pct is not None and tempo_gap_pct > 12.0
+        and halftime_ratio(a.bpm, b.bpm) != 1.0
+    ):
+        facts["halftime_note"] = (
+            "the BPMs sit at a 2:1 half/double-time ratio — the beat grids "
+            "interlock natively, so treat the tempo gap as SMALL. Drum-led "
+            "styles (drum_bridge, drop_swap, double_drop) work great here."
+        )
+    return facts
 
 
 def _parse_decision(obj) -> TransitionDecision:
@@ -170,6 +189,11 @@ async def build_plan_v2(
     nonce: int = 0,
     pitch_mode: str = "temporary",
     loudness_match: bool = True,
+    avoid_styles: list[str] | None = None,
+    bass_swap: bool = True,
+    tempo_meet: bool = True,
+    extra_context: dict | None = None,
+    tease_enabled: bool = False,
 ) -> PlanOutcome:
     # Lazy import keeps the mixer package importable without the llm
     # package's heavy provider dependencies (pure unit tests, tooling).
@@ -209,6 +233,19 @@ async def build_plan_v2(
         )
 
     context: dict = {}
+    if extra_context:
+        # Occasion / vibe / listener-feedback / energy-dial lines from the
+        # worker. Merged first so the planner-specific keys below win on
+        # collision.
+        context.update(extra_context)
+    if tease_enabled:
+        context["hook_teasing"] = (
+            "Hook teasing is ENABLED for this set: you may add "
+            '"tease": true to your decision to sneak B\'s vocal hook over '
+            "an instrumental pocket late in A, minutes before the seam. "
+            "Use it SPARINGLY (at most ~2 per set) and only when B's hook "
+            "is genuinely iconic; placement is computed automatically."
+        )
     if pinned_style is not None:
         context["forced_style"] = (
             f"The user pinned this transition's style to '{pinned_style.value}'. "
@@ -218,6 +255,11 @@ async def build_plan_v2(
         context["suggested_style"] = style_hint
     if previous_styles:
         context["styles_used_so_far"] = previous_styles
+    if avoid_styles:
+        context["avoid_styles"] = (
+            f"A previous render of this pair failed automated audio QA using "
+            f"style(s) {', '.join(avoid_styles)} — choose a DIFFERENT style."
+        )
     if pair_label:
         # e.g. "transition 3 of 5" — lets the model shape the set's arc
         # (open gently, peak in the middle, land the closer).
@@ -244,6 +286,10 @@ async def build_plan_v2(
             source = "llm_v2_repaired"
     except Exception as exc:
         logger.error("planner_v2: LLM decision failed: %s", exc)
+
+    if decision is not None and decision.tease and not tease_enabled:
+        # The model opted into a feature the queue didn't enable.
+        decision = decision.model_copy(update={"tease": False})
 
     if decision is not None and pinned_style is not None:
         if decision.style != pinned_style:
@@ -272,13 +318,90 @@ async def build_plan_v2(
             update={"duration_bars": decision.normalized_duration()}
         )
 
+    # double_drop stacks both songs at full energy — it only works when
+    # the keys are Camelot-compatible, the (half-time-aware) tempo gap is
+    # small, and BOTH chosen seams really are drops. Anything less
+    # downgrades to a plain drop_swap. A user pin is honored as-is.
+    if (
+        decision is not None
+        and pinned_style is None
+        and decision.style == TransitionStyle.double_drop
+    ):
+        out_c = candidates.find(decision.out)
+        in_c = candidates.find(decision.in_)
+        gap_ok = False
+        if a_eff.bpm and b_eff.bpm:
+            ratio = halftime_ratio(a_eff.bpm, b_eff.bpm)
+            target = a_eff.bpm * ratio
+            gap_ok = abs(target - b_eff.bpm) / target <= 0.06
+        ok = (
+            gap_ok
+            and camelot_compatible(a_eff.camelot_key, b_eff.camelot_key)
+            and out_c is not None and out_c.energy >= 0.8
+            and in_c is not None and in_c.energy >= 0.8
+        )
+        if not ok:
+            logger.info(
+                "planner_v2: double_drop conditions not met; downgrading "
+                "to drop_swap"
+            )
+            decision = decision.model_copy(
+                update={"style": TransitionStyle.drop_swap}
+            )
+            decision = decision.model_copy(
+                update={"duration_bars": decision.normalized_duration()}
+            )
+
+    # Theatrics gate: vinyl_stop / backspin are full-stop moves — the
+    # escape hatch for pairs that genuinely can't blend (unbridgeable
+    # tempo gap with no half-time relationship, or an unmatchable key
+    # clash). On an ordinary pair they read as showing off, and twice in
+    # one set they read as a broken record. Downgrade to drop_swap (keeps
+    # the snap) unless the user pinned the style.
+    THEATRICS = (TransitionStyle.vinyl_stop, TransitionStyle.backspin)
+    if (
+        decision is not None
+        and pinned_style is None
+        and decision.style in THEATRICS
+    ):
+        already_used = any(s in {t.value for t in THEATRICS}
+                           for s in (previous_styles or []))
+        gap_bridgeable = True
+        if a_eff.bpm and b_eff.bpm:
+            ratio = halftime_ratio(a_eff.bpm, b_eff.bpm)
+            target = a_eff.bpm * ratio
+            gap_bridgeable = abs(target - b_eff.bpm) / target <= 0.12
+        keys_workable = camelot_compatible(a_eff.camelot_key, b_eff.camelot_key)
+        if pitch_mode != "off" and not keys_workable:
+            # A modest clash is fixable by the pitch machinery; only a
+            # beyond-cap clash justifies the full stop.
+            try:
+                keys_workable = abs(
+                    compute_pitch_shift(a_eff.key, b_eff.key)
+                ) <= 2
+            except ValueError:
+                keys_workable = False
+        justified = not (gap_bridgeable and keys_workable)
+        if already_used or not justified:
+            logger.info(
+                "planner_v2: downgrading %s (used_before=%s, justified=%s)",
+                decision.style.value, already_used, justified,
+            )
+            decision = decision.model_copy(
+                update={"style": TransitionStyle.drop_swap}
+            )
+            decision = decision.model_copy(
+                update={"duration_bars": decision.normalized_duration()}
+            )
+
     if decision is not None:
         try:
             plan = expand(
                 decision, a_eff, b_eff, candidates, pitch_mode,
                 a_safe_regions=a.safe_regions, b_safe_regions=b.safe_regions,
                 a_energy_curve=a.energy_curve, b_energy_curve=b.energy_curve,
-                loudness_match=loudness_match,
+                loudness_match=loudness_match, bass_swap=bass_swap,
+                tempo_meet=tempo_meet,
             )
             return PlanOutcome(
                 plan=plan, source=source,
@@ -296,7 +419,8 @@ async def build_plan_v2(
             fallback, a_eff, b_eff, candidates, pitch_mode,
             a_safe_regions=a.safe_regions, b_safe_regions=b.safe_regions,
             a_energy_curve=a.energy_curve, b_energy_curve=b.energy_curve,
-            loudness_match=loudness_match,
+            loudness_match=loudness_match, bass_swap=bass_swap,
+            tempo_meet=tempo_meet,
         )
         return PlanOutcome(
             plan=plan, source="style_default",

@@ -74,6 +74,46 @@ class Settings(BaseSettings):
     # at +4 dB, cut at -6 dB; gaps under ~1.25 dB are left alone.
     loudness_match: bool = True
 
+    # EQ-style bass swap on long blends (smooth_blend / drum_bridge /
+    # wash_out, >= 8 bars): the bass stems hand over in a 2-bar window at
+    # the crossfade midpoint instead of blending across the full window —
+    # two overlapping basslines read as mud. Off restores the coupled
+    # full-window bass crossfade.
+    bass_swap: bool = True
+
+    # Tempo meet-in-the-middle: for 4-12% tempo gaps, A ramps to the
+    # midpoint BPM over its last 16 bars, the crossfade runs at mid-tempo
+    # and B glides from mid to native afterwards — each song carries half
+    # the stretch artifact. Off restores the one-sided B-only stretch.
+    tempo_meet_in_middle: bool = True
+
+    # TTS host (F11): the voice that opens the set and drops the
+    # occasional mic moment. "kokoro" runs the local Kokoro-82M model —
+    # free, no API key, weights fetched from HuggingFace on first use.
+    # "openai" uses gpt-4o-mini-tts (needs openai_api_key). "off"
+    # disables the host entirely regardless of per-queue settings.
+    tts_provider: str = "kokoro"  # kokoro | openai | off
+    # Voice id per provider: kokoro voices look like "af_heart"/"am_puck";
+    # openai voices like "onyx"/"nova"/"ash".
+    tts_voice: str = "af_heart"
+    openai_api_key: str = ""
+    # Default host frequency when the queue doesn't set one.
+    host_frequency: str = "intro_only"  # off | intro_only | sparse | chatty
+
+    # TTS host (F11): the DJ voice — set intro + occasional mic drops,
+    # ducked under the music at stitch time.
+    # "kokoro" (default): Kokoro-82M, local and free, no API key.
+    # "openai": gpt-4o-mini-tts via the OpenAI API (needs openai_api_key).
+    # "off": never speak.
+    tts_provider: str = "kokoro"  # kokoro | openai | off
+    # Voice id per provider (kokoro: af_heart/am_michael/bf_emma/...;
+    # openai: alloy/ash/coral/onyx/nova/...).
+    tts_voice: str = "af_heart"
+    openai_api_key: str = ""
+    # Default mic-time when a queue doesn't set its own:
+    # off | intro_only | sparse (intro + 1-2 mid-set) | chatty.
+    host_frequency: str = "intro_only"
+
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
     # Required on cloud hosts (the droplet) — YouTube's anti-bot system
     # rejects datacenter IPs unless an authenticated session is presented.

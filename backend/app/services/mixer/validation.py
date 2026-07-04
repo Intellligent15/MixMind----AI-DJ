@@ -32,7 +32,9 @@ LEGAL_TOOLS = {
     "swap_stem",
     "apply_reverb",
     "turntable_stop",
+    "backspin",
     "volume_fade",
+    "vocal_tease",
 }
 CANONICAL_STEMS = {"vocals", "drums", "bass", "other"}
 LEGAL_SONG_REFS = {"A", "B"}
@@ -47,7 +49,9 @@ SONG_FIELDS_BY_TOOL = {
     "swap_stem": ("from_song", "to_song"),
     "apply_reverb": ("song",),
     "turntable_stop": ("song",),
+    "backspin": ("song",),
     "volume_fade": ("song",),
+    "vocal_tease": ("song",),
 }
 PERMANENT_PITCH_SHIFT_CAP = 2
 PITCH_RETURN_BARS = 4
@@ -298,6 +302,12 @@ def enforce_revert_after_crossfade(
     out: list[dict] = []
     for call in plan:
         tool = call.get("tool")
+        if tool == "set_tempo_ramp" and call.get("song") == "A":
+            # The A-side meet-in-the-middle ramp lives BEFORE the seam by
+            # design — deferring it past the crossfade (a B-time bound)
+            # would be nonsense. Leave it alone.
+            out.append(call)
+            continue
         if tool == "set_tempo_ramp":
             start = float(call.get("start_time", 0.0))
             if start < crossfade_end_b:

@@ -724,3 +724,96 @@ def test_render_transition_rejects_llm_permanent_pitch_shift(pair_with_plan):
         assert len(temp) == 1
         assert temp[0]["semitones"] == 2  # 5 clamped to the ±2 cap
         assert row.plan_source == "llm_legacy_repaired"
+
+
+# ---------- render QA + auto-reroll ----------
+
+def _qa_report(verdict: str) -> "QAReport":
+    from app.services.mixer.qa import QAReport
+    flags = [] if verdict == "pass" else [f"{verdict}:clipping"]
+    return QAReport(verdict=verdict, metrics={"clip_ratio": 0.5}, flags=flags)
+
+
+def _outcome(style: str) -> "PlanOutcome":
+    from app.services.mixer.planner_v2 import PlanOutcome
+    return PlanOutcome(
+        plan=_valid_plan(), source="llm_v2", style=style, rationale="r"
+    )
+
+
+def test_render_qa_fail_triggers_one_replan_with_avoided_style(pair_with_plan):
+    storage = AsyncMock()
+
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+
+    build_mock = AsyncMock(side_effect=[_outcome("wash_out"),
+                                        _outcome("smooth_blend")])
+    with (
+        patch("app.workers.render_transition.render",
+              side_effect=[_patched_render(), _patched_render()]) as render_mock,
+        patch("app.workers.render_transition.score_render",
+              side_effect=[_qa_report("fail"), _qa_report("pass")]) as score_mock,
+        patch("app.workers.render_transition.build_plan_v2", build_mock),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider",
+              return_value=MagicMock()),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "v2"),
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    assert render_mock.call_count == 2
+    assert score_mock.call_count == 2
+    assert build_mock.call_count == 2
+    retry_kwargs = build_mock.call_args_list[1].kwargs
+    assert retry_kwargs["avoid_styles"] == ["wash_out"]
+    assert retry_kwargs["nonce"] == 1
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.status == MixPlanStatus.ready
+        assert row.qa_verdict == "pass"
+        assert row.style == "smooth_blend"      # retry plan adopted
+        assert row.reroll_nonce == 1            # cache key moved past the bad plan
+        assert "fail:clipping" not in (row.qa_metrics or {}).get("flags", [])
+
+
+def test_render_qa_fail_with_style_pin_ships_without_retry(pair_with_plan):
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        row.style_override = "wash_out"
+        db.commit()
+
+    storage = AsyncMock()
+
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+
+    build_mock = AsyncMock(side_effect=[_outcome("wash_out")])
+    with (
+        patch("app.workers.render_transition.render",
+              return_value=_patched_render()) as render_mock,
+        patch("app.workers.render_transition.score_render",
+              return_value=_qa_report("fail")),
+        patch("app.workers.render_transition.build_plan_v2", build_mock),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider",
+              return_value=MagicMock()),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "v2"),
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    assert render_mock.call_count == 1          # the pin is the user's call
+    assert build_mock.call_count == 1
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.status == MixPlanStatus.ready
+        assert row.qa_verdict == "fail"         # shipped, but honestly labeled
+        assert row.reroll_nonce == 0

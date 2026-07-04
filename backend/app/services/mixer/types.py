@@ -269,6 +269,9 @@ class AnalysisBundle:
     downbeats: list[float]
     sections: list[dict]   # each has at least {"start": float, "end": float}
     duration: float
+    envelopes: dict | None = None
+    transcription_segments: list[dict] | None = None
+    tags: dict | None = None
 
 
 @dataclass(frozen=True)

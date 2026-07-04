@@ -30,7 +30,7 @@ MAX_CROSSFADE_BARS = 16
 # vs `Song.duration_seconds` metadata (Demucs trims/pads, yt-dlp rounds).
 SEAM_SAFETY_SECONDS = 5.0
 # Cap the menu so the prompt stays small and the choice stays easy.
-MAX_CANDIDATES = 5
+MAX_CANDIDATES = 6
 # Two candidates closer than this are duplicates for mixing purposes.
 DEDUP_SECONDS = 2.0
 # B entry points past this fraction of the song are pointless — the
@@ -41,6 +41,16 @@ B_ENTRY_MAX_FRACTION = 0.5
 VOCAL_SAFE_LOOKAHEAD_BARS = 2.0
 # Sections with normalized energy at/above this read as a drop/chorus.
 HIGH_ENERGY_THRESHOLD = 0.8
+# ...and at/below this read as a breakdown/outro (breakdown_blend fuel).
+LOW_ENERGY_THRESHOLD = 0.4
+# Phrase lengths to try when building the phrase grid, in bars. Human DJs
+# mix on 16/32-bar phrases; 16 fits typical 3+ minute dance tracks, 8 is
+# the fallback for shorter songs where a 16-bar grid leaves too few
+# boundaries to choose from.
+PHRASE_BARS_CHOICES = (16, 8)
+# A phrase-snapped time may overshoot the raw target by at most one
+# phrase; anything past the headroom ceiling falls back to downbeat snap.
+MIN_GRID_BOUNDARIES = 3
 
 
 def max_seam_time(duration: float, bpm: float, time_signature: int) -> float:
@@ -99,15 +109,29 @@ class SeamCandidate:
     description: str       # human/LLM-readable role, e.g. "start of final section"
     energy: float          # normalized 0..1 section energy at this point
     vocal_safe: bool       # True if a hard cut here avoids chopping a word
+    # Densities are 0.0-1.0 over the lookahead window, or None when the
+    # underlying data (safety regions / stem envelopes) is missing —
+    # None is omitted from the LLM dict rather than passed off as 0.0.
+    vocal_density: float | None = None
+    drum_density: float | None = None
+    bass_density: float | None = None
+    lyrics_preview: str | None = None
 
     def to_llm_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "time": round(self.time, 2),
             "description": self.description,
             "energy": self.energy,
             "vocal_safe": self.vocal_safe,
         }
+        for name in ("vocal_density", "drum_density", "bass_density"):
+            value = getattr(self, name)
+            if value is not None:
+                d[name] = round(value, 2)
+        if self.lyrics_preview:
+            d["lyrics_preview"] = self.lyrics_preview
+        return d
 
 
 @dataclass(frozen=True)
@@ -145,6 +169,90 @@ def _snap_to_downbeat_at_or_before(t: float, downbeats: list[float]) -> float:
     return best if best is not None else downbeats[0]
 
 
+def phrase_grid(
+    downbeats: list[float],
+    sections: list[dict],
+    bars_per_phrase: int | None = None,
+) -> list[float]:
+    """Times of musical phrase starts, derived from the downbeat grid.
+
+    Human DJs mix on 8/16-bar phrase boundaries, not arbitrary downbeats
+    — a seam on bar 3 of a phrase is on-grid but musically "off". Each
+    section re-anchors the phrase counter at its first downbeat (song
+    structure resets phrasing); within a section every Nth downbeat is a
+    phrase start. With no section data the grid anchors at downbeat 0.
+
+    When `bars_per_phrase` is None, tries PHRASE_BARS_CHOICES in order
+    and keeps the first grid dense enough to be a real menu
+    (>= MIN_GRID_BOUNDARIES boundaries) — long tracks get 16-bar
+    phrasing, short ones fall back to 8.
+    """
+    if not downbeats:
+        return []
+
+    def _build(n_bars: int) -> list[float]:
+        anchors: list[tuple[float, float]] = []  # (anchor_time, region_end)
+        if sections:
+            for i, s in enumerate(sections):
+                end = sections[i + 1]["start"] if i + 1 < len(sections) else float("inf")
+                anchors.append((float(s["start"]), float(end)))
+        else:
+            anchors.append((downbeats[0], float("inf")))
+
+        grid: list[float] = []
+        for start, end in anchors:
+            # First downbeat at/after the anchor.
+            idx = next((i for i, d in enumerate(downbeats) if d >= start), None)
+            if idx is None:
+                continue
+            i = idx
+            while i < len(downbeats) and downbeats[i] < end:
+                if not grid or downbeats[i] > grid[-1]:
+                    grid.append(downbeats[i])
+                i += n_bars
+        return grid
+
+    if bars_per_phrase is not None:
+        return _build(bars_per_phrase)
+    grid: list[float] = []
+    for n_bars in PHRASE_BARS_CHOICES:
+        grid = _build(n_bars)
+        if len(grid) >= MIN_GRID_BOUNDARIES:
+            return grid
+    return grid
+
+
+def _snap_to_phrase(
+    t: float,
+    grid: list[float],
+    downbeats: list[float],
+    ceiling: float | None = None,
+) -> float:
+    """Next phrase boundary ≥ t; plain downbeat snap when the grid is
+    empty, exhausted, or the boundary would overshoot the ceiling."""
+    for g in grid:
+        if g >= t:
+            if ceiling is not None and g > ceiling:
+                break
+            return g
+    return _snap_to_downbeat(t, downbeats)
+
+
+def _snap_to_phrase_at_or_before(
+    t: float, grid: list[float], downbeats: list[float]
+) -> float:
+    """Latest phrase boundary ≤ t; downbeat-at-or-before fallback."""
+    best = None
+    for g in grid:
+        if g <= t:
+            best = g
+        else:
+            break
+    if best is not None:
+        return best
+    return _snap_to_downbeat_at_or_before(t, downbeats)
+
+
 def _is_vocal_safe(
     t: float,
     safe_regions: list[dict],
@@ -168,6 +276,89 @@ def _is_vocal_safe(
     return False
 
 
+def _vocal_density(
+    t: float,
+    safe_regions: list[dict],
+    lookahead_seconds: float,
+) -> float | None:
+    """Fraction of [t, t + lookahead] NOT covered by a safe (silent) region.
+
+    Returns None when there is no safety data at all — "unknown", which
+    to_llm_dict omits, matching _is_vocal_safe's conservative False for
+    the same case rather than claiming the point is instrumental.
+    """
+    if not safe_regions or lookahead_seconds <= 0:
+        return None
+
+    safe_dur = 0.0
+    end_t = t + lookahead_seconds
+    for r in safe_regions:
+        if "safe" in r and not r.get("safe"):
+            continue
+        overlap_start = max(t, r["start"])
+        overlap_end = min(end_t, r["end"])
+        if overlap_start < overlap_end:
+            safe_dur += (overlap_end - overlap_start)
+            
+    return min(1.0, (lookahead_seconds - safe_dur) / lookahead_seconds)
+
+
+def _stem_density(
+    t: float, envelopes: dict | None, stem_name: str, lookahead_seconds: float
+) -> float | None:
+    """Average stem RMS over the lookahead window, scaled to 0..1.
+
+    None (= "unknown", omitted from the LLM dict) when the envelope
+    sidecar is missing or predates the multi-stem schema."""
+    if not envelopes or stem_name not in envelopes or lookahead_seconds <= 0:
+        return None
+    frame_hz = envelopes.get("frame_hz", 10)
+    rms_array = envelopes[stem_name].get("rms", [])
+    if not rms_array:
+        return None
+    start_frame = int(t * frame_hz)
+    end_frame = int((t + lookahead_seconds) * frame_hz)
+    end_frame = max(start_frame + 1, min(end_frame, len(rms_array)))
+    if start_frame >= len(rms_array):
+        return 0.0
+    window = rms_array[start_frame:end_frame]
+    avg = sum(window) / len(window)
+    # Scale: an RMS of 0.15 is generally "full" density for a single stem
+    return min(1.0, avg / 0.15)
+
+
+def _lyrics_preview(
+    t: float, segments: list[dict] | None, lookahead_seconds: float, is_out: bool
+) -> str | None:
+    if not segments:
+        return None
+    start_t = t - lookahead_seconds if is_out else t
+    end_t = t if is_out else t + lookahead_seconds
+    
+    words = []
+    for seg in segments:
+        if "words" in seg and seg["words"]:
+            for w in seg["words"]:
+                if start_t <= w["start"] and w["end"] <= end_t:
+                    words.append(w["word"].strip())
+        else:
+            if start_t <= seg["start"] and seg["end"] <= end_t:
+                words.append(seg["text"].strip())
+    
+    if not words:
+        return None
+    text = " ".join(words)
+    if len(text) > 200:
+        return text[:197] + "..."
+    return text
+
+
+def _phrase_tag(t: float, grid: list[float]) -> str:
+    """Suffix for candidate descriptions when `t` sits on the phrase grid,
+    so the LLM can prefer phrase-aligned seams explicitly."""
+    return " (phrase-aligned)" if any(abs(t - g) < 1e-6 for g in grid) else ""
+
+
 def _dedup_and_cap(cands: list[SeamCandidate]) -> list[SeamCandidate]:
     cands = sorted(cands, key=lambda c: c.time)
     kept: list[SeamCandidate] = []
@@ -186,6 +377,10 @@ def _reid(cands: list[SeamCandidate], prefix: str) -> list[SeamCandidate]:
             description=c.description,
             energy=c.energy,
             vocal_safe=c.vocal_safe,
+            vocal_density=c.vocal_density,
+            drum_density=c.drum_density,
+            bass_density=c.bass_density,
+            lyrics_preview=c.lyrics_preview,
         )
         for i, c in enumerate(cands)
     ]
@@ -204,11 +399,51 @@ def build_out_candidates(
     sec_per_bar = (60.0 / a.bpm) * a.time_signature if a.bpm else 0.0
     lookahead = VOCAL_SAFE_LOOKAHEAD_BARS * sec_per_bar
     sections = enrich_sections(a.sections, energy_curve)
+    grid = phrase_grid(a.downbeats, a.sections)
+
+    def _out_candidate(t: float, description: str, energy: float) -> SeamCandidate:
+        return SeamCandidate(
+            id="A?", time=t, description=description, energy=energy,
+            vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
+            vocal_density=_vocal_density(t, safe_regions, lookahead),
+            drum_density=_stem_density(t, a.envelopes, "drums", lookahead),
+            bass_density=_stem_density(t, a.envelopes, "bass", lookahead),
+            lyrics_preview=_lyrics_preview(
+                t, a.transcription_segments, lookahead, is_out=True
+            ),
+        )
 
     raw: list[SeamCandidate] = []
     n = len(sections)
+
+    # The last high-energy section start ("the drop") and the final
+    # low-energy section start ("the breakdown/outro") — double_drop and
+    # breakdown_blend material. Appended FIRST: on a time collision with
+    # the generic section candidates below, dedup keeps the first entry,
+    # and these role labels tell the LLM strictly more.
+    for s in reversed(sections):
+        if s["energy"] >= HIGH_ENERGY_THRESHOLD:
+            t = _snap_to_phrase(s["start"], grid, a.downbeats, ceiling)
+            if t <= ceiling:
+                raw.append(_out_candidate(
+                    t,
+                    "last drop/chorus (high energy)" + _phrase_tag(t, grid),
+                    s["energy"],
+                ))
+            break
+    for s in reversed(sections):
+        if s["energy"] <= LOW_ENERGY_THRESHOLD:
+            t = _snap_to_phrase(s["start"], grid, a.downbeats, ceiling)
+            if t <= ceiling:
+                raw.append(_out_candidate(
+                    t,
+                    "final breakdown (low energy)" + _phrase_tag(t, grid),
+                    s["energy"],
+                ))
+            break
+
     for i, s in enumerate(sections):
-        t = _snap_to_downbeat(s["start"], a.downbeats)
+        t = _snap_to_phrase(s["start"], grid, a.downbeats, ceiling)
         if t > ceiling:
             # Section starts too late to fit a crossfade — skip; the
             # "late as possible" fallback below covers the tail.
@@ -220,26 +455,20 @@ def build_out_candidates(
             "second-to-last section" if i == n - 2 else "late section"
         )
         label = s.get("label")
-        desc = f"start of {role}" + (f" ({label})" if label else "")
-        raw.append(
-            SeamCandidate(
-                id="A?", time=t, description=desc, energy=s["energy"],
-                vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
-            )
+        desc = (
+            f"start of {role}" + (f" ({label})" if label else "")
+            + _phrase_tag(t, grid)
         )
+        raw.append(_out_candidate(t, desc, s["energy"]))
 
     # Always offer "as late as the headroom allows" — the v1 default.
-    late = _snap_to_downbeat_at_or_before(ceiling, a.downbeats)
+    late = _snap_to_phrase_at_or_before(ceiling, grid, a.downbeats)
     if late <= ceiling:
-        energy = _energy_at(sections, late)
-        raw.append(
-            SeamCandidate(
-                id="A?", time=late,
-                description="latest possible out point (16 bars before the end)",
-                energy=energy,
-                vocal_safe=_is_vocal_safe(late, safe_regions, lookahead),
-            )
-        )
+        raw.append(_out_candidate(
+            late,
+            "latest possible out point" + _phrase_tag(late, grid),
+            _energy_at(sections, late),
+        ))
 
     return _reid(_dedup_and_cap(raw), "A")
 
@@ -260,71 +489,69 @@ def build_in_candidates(
     sec_per_bar = (60.0 / b.bpm) * b.time_signature if b.bpm else 0.0
     lookahead = VOCAL_SAFE_LOOKAHEAD_BARS * sec_per_bar
     sections = enrich_sections(b.sections, energy_curve)
+    grid = phrase_grid(b.downbeats, b.sections)
+
+    def _candidate(t: float, description: str, energy: float) -> SeamCandidate:
+        return SeamCandidate(
+            id="B?", time=t, description=description, energy=energy,
+            vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
+            vocal_density=_vocal_density(t, safe_regions, lookahead),
+            drum_density=_stem_density(t, b.envelopes, "drums", lookahead),
+            bass_density=_stem_density(t, b.envelopes, "bass", lookahead),
+            lyrics_preview=_lyrics_preview(
+                t, b.transcription_segments, lookahead, is_out=False
+            ),
+        )
 
     raw: list[SeamCandidate] = []
 
-    # v1's default: first downbeat after the first section (skips silent
-    # intros / count-ins).
+    # v1's default: first phrase boundary after the first section (skips
+    # silent intros / count-ins).
     if sections:
-        t = _snap_to_downbeat(sections[0]["end"], b.downbeats)
+        t = _snap_to_phrase(sections[0]["end"], grid, b.downbeats, ceiling)
         if t <= ceiling:
             raw.append(
-                SeamCandidate(
-                    id="B?", time=t, description="end of intro / first section",
-                    energy=_energy_at(sections, t),
-                    vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
+                _candidate(
+                    t,
+                    "end of intro / first section" + _phrase_tag(t, grid),
+                    _energy_at(sections, t),
                 )
             )
     else:
         t = _snap_to_downbeat(0.0, b.downbeats)
         if t <= ceiling:
-            raw.append(
-                SeamCandidate(
-                    id="B?", time=t, description="start of the song",
-                    energy=0.5, vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
-                )
-            )
+            raw.append(_candidate(t, "start of the song", 0.5))
 
     # First high-energy section start = "the first drop / chorus".
     for i, s in enumerate(sections):
         if s["energy"] >= HIGH_ENERGY_THRESHOLD:
-            t = _snap_to_downbeat(s["start"], b.downbeats)
+            t = _snap_to_phrase(s["start"], grid, b.downbeats, ceiling)
             if t <= ceiling:
                 label = s.get("label")
-                desc = "first high-energy section (drop/chorus)" + (
-                    f" ({label})" if label else ""
+                desc = (
+                    "first high-energy section (drop/chorus)"
+                    + (f" ({label})" if label else "")
+                    + _phrase_tag(t, grid)
                 )
-                raw.append(
-                    SeamCandidate(
-                        id="B?", time=t, description=desc, energy=s["energy"],
-                        vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
-                    )
-                )
+                raw.append(_candidate(t, desc, s["energy"]))
             break
 
     # Starts of sections 2 and 3 round out the early-song menu.
     for i, s in enumerate(sections[1:3], start=2):
-        t = _snap_to_downbeat(s["start"], b.downbeats)
+        t = _snap_to_phrase(s["start"], grid, b.downbeats, ceiling)
         if t <= ceiling:
             label = s.get("label")
-            desc = f"start of section {i}" + (f" ({label})" if label else "")
-            raw.append(
-                SeamCandidate(
-                    id="B?", time=t, description=desc, energy=s["energy"],
-                    vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
-                )
+            desc = (
+                f"start of section {i}" + (f" ({label})" if label else "")
+                + _phrase_tag(t, grid)
             )
+            raw.append(_candidate(t, desc, s["energy"]))
 
     if not raw:
         # Degenerate analysis — offer the first usable downbeat.
         t = _snap_to_downbeat(0.0, b.downbeats)
         if t <= ceiling:
-            raw.append(
-                SeamCandidate(
-                    id="B?", time=t, description="start of the song",
-                    energy=0.5, vocal_safe=_is_vocal_safe(t, safe_regions, lookahead),
-                )
-            )
+            raw.append(_candidate(t, "start of the song", 0.5))
 
     return _reid(_dedup_and_cap(raw), "B")
 

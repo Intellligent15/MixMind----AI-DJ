@@ -19,6 +19,8 @@ import soundfile as sf
 from app.services.mixer.executor import (
     SOFT_CLIP_CEILING,
     SOFT_KNEE_THRESHOLD,
+    _apply_filter_sweep,
+    _apply_reverb,
     _soft_knee_limit,
     render,
 )
@@ -1343,6 +1345,126 @@ def test_volume_fade_targets_single_stem_when_stem_set():
     assert just_before == pytest.approx(0.2, abs=1e-3)
 
 
+def test_filter_sweep_onset_has_no_transient_click():
+    """The filter state must be scaled to the first sample. Unscaled
+    sosfilt_zi is the steady state for a unit-step (DC 1.0) input, which
+    injected a ringing transient ~4x the signal peak at the sweep onset —
+    the click heard at the start of every washout transition."""
+    x = (0.05 * np.sin(2 * np.pi * 220.0 * np.arange(SR) / SR)).astype(np.float32)
+    audio = np.column_stack((x, x))
+    call = {
+        "tool": "filter_sweep", "type": "lowpass",
+        "start_time": 0.25, "end_time": 0.75,
+        "start_cutoff_hz": 20000.0, "end_cutoff_hz": 120.0,
+    }
+    out = _apply_filter_sweep(audio, call)
+    assert float(np.max(np.abs(out))) < 0.08, (
+        "filter sweep onset rang above the signal's own scale"
+    )
+
+
+def test_apply_reverb_ramps_wet_in_without_step():
+    """The wet/dry mix must ramp in, not hard-switch: at wet_level 0.8 the
+    old instant switch dropped the dry signal -14 dB in one sample."""
+    n = SR * 2
+    x = (0.5 * np.sin(2 * np.pi * 180.0 * np.arange(n) / SR)).astype(np.float32)
+    audio = np.column_stack((x, x))
+    call = {
+        "tool": "apply_reverb", "song": "A", "start_time": 1.0,
+        "tail_duration_bars": 2.0, "wet_level": 0.8, "bpm": 120.0,
+    }
+    out = _apply_reverb(audio, call)
+    start = SR
+    # At the onset the mix is still ~fully dry — no step.
+    assert np.allclose(out[start : start + 64], audio[start : start + 64], atol=2e-3)
+    # No sample-to-sample jump beyond what the dry waveform itself has.
+    dry_step = float(np.max(np.abs(np.diff(x[start - 200 : start + 200]))))
+    out_step = float(np.max(np.abs(np.diff(out[start - 200 : start + 200, 0]))))
+    assert out_step <= dry_step * 1.5
+    # The wash does arrive once the ramp has opened up.
+    assert not np.allclose(out[int(1.9 * SR):], audio[int(1.9 * SR):], atol=1e-2)
+
+
+def test_render_keeps_a_master_before_fx_onset():
+    """An A-side effect (washout's reverb at the seam) must not swap A's
+    whole pre-seam body to the stem reconstruction: the untouched master
+    (0.3) plays until the effect's onset, not the stem sum (0.4)."""
+    a = SongRenderInputs(
+        stem_paths=_stems_dict("A"), analysis=_bundle(),
+        original_audio_path="orig/A_master.wav",
+    )
+    b = _inputs(prefix="B")
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "master" in path:
+            return 0.3 * np.ones((N, 2), dtype=np.float32), SR
+        sig = 0.2 * np.ones((N, 2), dtype=np.float32)
+        if "drums" in path:
+            sig = -sig
+        return sig, SR  # 4-stem sum = 0.4
+
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 2.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "apply_reverb", "song": "A", "start_time": 2.0,
+         "tail_duration_bars": 2.0, "wet_level": 0.8, "bpm": 120.0},
+        *[
+            {"tool": "crossfade_stem", "stem": s, "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_read):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+    head = np.mean(np.abs(out[int(0.5 * SR): int(0.6 * SR)]))
+    assert abs(head - 0.3) < 0.02, f"A head should be master 0.3, got {head}"
+
+
+def test_render_a_fx_before_seam_switches_to_processed_at_onset():
+    """A stem-scoped fade beginning before the seam (bass_kill) must still
+    be audible pre-seam: master until the fade's onset, processed stem-sum
+    after it."""
+    a = SongRenderInputs(
+        stem_paths=_stems_dict("A"), analysis=_bundle(),
+        original_audio_path="orig/A_master.wav",
+    )
+    b = _inputs(prefix="B")
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "master" in path:
+            return 0.3 * np.ones((N, 2), dtype=np.float32), SR
+        sig = 0.2 * np.ones((N, 2), dtype=np.float32)
+        if "drums" in path:
+            sig = -sig
+        return sig, SR
+
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 2.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        # Kill A's bass from 1.0 s, done by 1.5 s (0.25 bars @ 120bpm 4/4).
+        {"tool": "volume_fade", "song": "A", "stem": "bass",
+         "start_time": 1.0, "duration_bars": 0.25,
+         "start_gain": 1.0, "end_gain": 0.0, "bpm": 120.0},
+        *[
+            {"tool": "crossfade_stem", "stem": s, "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_read):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+    # Before the fade's onset: the master.
+    head = np.mean(np.abs(out[int(0.5 * SR): int(0.9 * SR)]))
+    assert abs(head - 0.3) < 0.02, f"pre-onset should be master 0.3, got {head}"
+    # After the fade completed (bass gone): processed sum 0.2-0.2+0+0.2 = 0.2.
+    killed = np.mean(np.abs(out[int(1.7 * SR): int(1.9 * SR)]))
+    assert abs(killed - 0.2) < 0.02, f"post-onset should be 0.2, got {killed}"
+
+
 def test_volume_fade_whole_song_when_no_stem():
     """Without `stem`, volume_fade fades the entire song (all four stems)."""
     a = _inputs(prefix="A")
@@ -1368,3 +1490,125 @@ def test_volume_fade_whole_song_when_no_stem():
     seam = int(round(sec_per_bar * SR))
     # Whole A faded to silence by the seam.
     assert decoded[seam - 200, 0] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_filter_sweep_targets_single_stem_when_stem_set():
+    """filter_sweep with `stem` sweeps only that stem (EQ-style bass kill):
+    A's bass is an 8 kHz tone that a 120 Hz lowpass silences; the other
+    stems are constant and must come through untouched."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    sec_per_bar = 2.0  # 120bpm
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "A/bass" in path:
+            t = np.arange(N) / SR
+            x = (0.2 * np.sin(2 * np.pi * 8000.0 * t)).astype(np.float32)
+            return np.column_stack((x, x)), SR
+        sig = 0.2 * np.ones((N, 2), dtype=np.float32)
+        if "drums" in path:
+            sig = -sig
+        return sig, SR
+
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": sec_per_bar, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "filter_sweep", "song": "A", "stem": "bass",
+         "type": "lowpass", "start_time": 0.0, "end_time": 1.0,
+         "start_cutoff_hz": 20000.0, "end_cutoff_hz": 120.0},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_read):
+        result = render(plan, a, b)
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    # After the sweep has closed (1.5-1.9s, still pre-seam): the 8 kHz bass
+    # is filtered to ~nothing, leaving vocals+drums+other = 0.2-0.2+0.2 = 0.2.
+    region = decoded[int(1.5 * SR): int(1.9 * SR), 0]
+    assert np.mean(np.abs(region)) == pytest.approx(0.2, abs=0.02)
+
+
+def test_apply_backspin_reverses_and_silences():
+    """The spin region plays the pre-cut audio backwards (a rising ramp
+    becomes a falling one) and everything after the spin is silence."""
+    from app.services.mixer.executor import _apply_backspin
+
+    n = SR * 4
+    ramp = np.linspace(0.0, 0.8, n, dtype=np.float32)
+    audio = np.column_stack((ramp, ramp))
+    call = {"tool": "backspin", "song": "A", "start_time": 2.0,
+            "duration_beats": 4.0, "bpm": 120.0}  # 4 beats = 2.0 s source
+    out = _apply_backspin(audio, call)
+
+    start = 2 * SR
+    # Untouched before the cut.
+    assert np.array_equal(out[:start], audio[:start])
+    # Spin region: starts at the last pre-cut value and falls (reversed).
+    spin = out[start: start + int(0.5 * SR), 0]
+    assert abs(spin[0] - audio[start - 1, 0]) < 1e-3
+    assert spin[0] > spin[-1] > 0.0
+    # Hard silence after the spin (~60% of the 2 s source).
+    assert np.max(np.abs(out[start + int(1.3 * SR):])) == 0.0
+
+
+def test_render_backspin_tool_runs_through_pre_fx():
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 2.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "backspin", "song": "A", "start_time": 2.0,
+         "duration_beats": 4.0, "bpm": 120.0},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    assert decoded.shape[0] > 0
+
+
+def test_render_halftime_ratio_avoids_stretch():
+    """tempo_ratio 2.0 on an 85/170 pair means B already interlocks —
+    no time-stretch call at all. Without the ratio the same pair would
+    demand a 2x stretch."""
+    a = _inputs(bpm=85.0, prefix="A")
+    b = _inputs(bpm=170.0, prefix="B")
+
+    def _plan(ratio: float | None):
+        window = {"tool": "set_transition_window",
+                  "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+                  "duration_bars": 1}
+        if ratio is not None:
+            window["tempo_ratio"] = ratio
+        return [
+            window,
+            *[
+                {"tool": "crossfade_stem", "stem": s,
+                 "from_song": "A", "to_song": "B",
+                 "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+                for s in ("vocals", "drums", "bass", "other")
+            ],
+        ]
+
+    with (
+        patch("soundfile.read", side_effect=_fake_sf_read()),
+        patch("pyrubberband.pyrb.time_stretch",
+              side_effect=lambda y, sr, rate: y) as stretch,
+    ):
+        render(_plan(2.0), a, b)
+        assert stretch.call_count == 0   # grids interlock natively
+
+        render(_plan(None), a, b)
+        assert stretch.call_count > 0    # 1:1 beatmatch needs the 2x stretch
+        assert stretch.call_args[0][2] == pytest.approx(0.5)  # 85/170

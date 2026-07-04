@@ -29,6 +29,7 @@ from app.services.mixer.decision import (
     TransitionExtra,
     TransitionStyle,
 )
+from app.services.mixer.hooks import find_hook, find_pocket
 from app.services.mixer.plan import compute_pitch_shift
 from app.services.mixer.types import AnalysisBundle, MixPlanJSON
 
@@ -55,6 +56,23 @@ STUTTER_BEAT_FRACTION = 0.5
 STUTTER_REPEATS = 8
 # vinyl_stop brake length.
 VINYL_STOP_BARS = 1.5
+# backspin: how much audio spins backwards (in A beats) before the cut.
+BACKSPIN_BEATS = 4.0
+# Half/double-time trick: when the raw tempo gap is too big to stretch
+# through (> MIN_RAW_GAP) but the BPMs sit near a 2:1 ratio (within
+# TOLERANCE), B is beatmatched at half/double time instead — 85 BPM
+# hip-hop under 170 BPM DnB interlocks natively, no 2x stretch.
+HALFTIME_MIN_RAW_GAP = 0.12
+HALFTIME_TOLERANCE = 0.04
+# Tempo meet-in-the-middle: for gaps in (MIN, MAX], A accelerates or
+# decelerates over its last MEET_RAMP_BARS to the midpoint BPM, the
+# crossfade runs at mid-tempo, and B glides from mid to native after —
+# each song carries half the stretch artifact instead of B eating it
+# all. Below MIN the stretch is inaudible (skip); above MAX the planner
+# routes around it (vinyl_stop / half-time).
+TEMPO_MEET_MIN_GAP = 0.04
+TEMPO_MEET_MAX_GAP = 0.12
+TEMPO_MEET_RAMP_BARS = 16
 # Acapella styles: how fast the NON-held stems swap, and the vocal
 # handover crossfade length. The held layer (A's vocals in acapella_out,
 # A's instrumental in acapella_in) rides until the handover bar.
@@ -72,6 +90,13 @@ ACAPELLA_BASS_SWAP_DUR = 1
 # vocal; restored once the vocal hands over.
 ACAPELLA_DUCK_GAIN = 0.65
 ACAPELLA_DUCK_RESTORE_BARS = 2
+# EQ-style bass swap: on long blends the basses hand over in a short
+# window at the crossfade midpoint instead of blending — two overlapping
+# basslines are instant mud, so A's bass exits just before the midpoint
+# and B's bass owns the low end from there (the way a DJ swaps bass EQ).
+BASS_SWAP_MIN_BARS = 8       # only blends at least this long get the swap
+BASS_SWAP_XFADE_BARS = 2     # handover window length, centered on the mid
+BASS_SWAP_STYLES = ("smooth_blend", "drum_bridge", "wash_out", "breakdown_blend")
 # Seam loudness matching: align B's perceived level to A's at the seam
 # (no energy pothole / spike), then glide back to B's native level after
 # the crossfade. Boosts are capped tighter than cuts — the output
@@ -92,6 +117,23 @@ def _sec_per_bar(bundle: AnalysisBundle) -> float:
     if not bundle.bpm:
         raise ArchetypeError("song has no bpm")
     return (60.0 / bundle.bpm) * bundle.time_signature
+
+
+def halftime_ratio(a_bpm: float | None, b_bpm: float | None) -> float:
+    """2.0 when B sits near double A's tempo, 0.5 near half, else 1.0.
+
+    "Near" is within HALFTIME_TOLERANCE. The ratio is B's beatmatch
+    multiplier: the executor stretches B toward ``a_bpm * ratio`` so the
+    two grids interlock at 2:1 (every A beat lands on every other B beat,
+    or vice versa) instead of forcing a huge 1:1 stretch.
+    """
+    if not a_bpm or not b_bpm:
+        return 1.0
+    if abs(b_bpm - 2.0 * a_bpm) / (2.0 * a_bpm) <= HALFTIME_TOLERANCE:
+        return 2.0
+    if abs(b_bpm - a_bpm / 2.0) / (a_bpm / 2.0) <= HALFTIME_TOLERANCE:
+        return 0.5
+    return 1.0
 
 
 def camelot_compatible(a_camelot: str | None, b_camelot: str | None) -> bool:
@@ -123,11 +165,12 @@ def _clamp_duration_bars(
     b: AnalysisBundle,
     seam_a: float,
     seam_b: float,
+    tempo_ratio: float = 1.0,
 ) -> int:
     """Shrink the crossfade if either song lacks the room — same clamp the
     deterministic planner applies, so the executor never has to."""
     spb_a = _sec_per_bar(a)
-    stretch = b.bpm / a.bpm if a.bpm and b.bpm else 1.0
+    stretch = b.bpm / (a.bpm * tempo_ratio) if a.bpm and b.bpm else 1.0
     available_a = a.duration - seam_a
     available_b_stretched = (b.duration - seam_b) * stretch
     clamped = min(
@@ -149,9 +192,14 @@ def _crossfade_calls(
     *,
     drums_start_bar: int = 0,
     drums_duration_bars: int | None = None,
+    bass_swap: bool = False,
 ) -> list[dict]:
     """The four stem crossfades. `drums_*` lets drum_bridge offset the
-    drum stem; everything else shares the main window."""
+    drum stem; `bass_swap` gives the bass stem a short midpoint handover
+    instead of the full-window blend (pure-A bass before it, pure-B bass
+    after — the executor's per-stem windowing renders exactly that);
+    everything else shares the main window."""
+    swap_bass = bass_swap and duration_bars >= BASS_SWAP_MIN_BARS
     calls = []
     for stem in STEMS:
         if stem == "drums" and (drums_start_bar or drums_duration_bars):
@@ -160,6 +208,22 @@ def _crossfade_calls(
                 "from_song": "A", "to_song": "B",
                 "start_bar": drums_start_bar,
                 "duration_bars": drums_duration_bars or duration_bars,
+                "curve": "equal_power",
+            })
+            continue
+        if stem == "bass" and swap_bass:
+            # Handover centers on the window midpoint, but never later
+            # than A's own exit — A's bass must not outlive the rest of A
+            # when the decision cuts A out early (a_fade < duration).
+            mid = min(duration_bars // 2, a_fade_out_bars)
+            calls.append({
+                "tool": "crossfade_stem", "stem": stem,
+                "from_song": "A", "to_song": "B",
+                "start_bar": max(0, mid - BASS_SWAP_XFADE_BARS // 2),
+                "duration_bars": BASS_SWAP_XFADE_BARS,
+                # A's bass is gone by the midpoint; B's swells in alone
+                # over the second half of the handover.
+                "a_fade_out_bars": BASS_SWAP_XFADE_BARS // 2,
                 "curve": "equal_power",
             })
             continue
@@ -181,14 +245,26 @@ def _tempo_and_pitch_calls(
     seam_b: float,
     crossfade_total_bars: int,
     pitch_mode: str = "temporary",
+    tempo_ratio: float = 1.0,
+    meet_bpm: float | None = None,
 ) -> list[dict]:
     """Tempo ramp + temporary pitch return, both anchored strictly AFTER
-    the bar where the last stem finishes its fade. Computed, not prompted."""
+    the bar where the last stem finishes its fade. Computed, not prompted.
+
+    `tempo_ratio` != 1.0 means B is beatmatched at half/double time: one
+    A-grid bar consumes `tempo_ratio` B-bars of original audio, and the
+    ramp target is `a.bpm * tempo_ratio` instead of `a.bpm`. `meet_bpm`
+    (tempo meet-in-the-middle) replaces `a.bpm` as the crossfade tempo."""
     calls: list[dict] = []
     spb_b = _sec_per_bar(b)
-    crossfade_end_b = seam_b + crossfade_total_bars * spb_b
+    # B-original seconds consumed per output bar is 60*ts*ratio/b.bpm —
+    # invariant to the crossfade tempo, so meet_bpm doesn't appear here.
+    crossfade_end_b = seam_b + crossfade_total_bars * spb_b * tempo_ratio
 
-    needs_ramp = a.bpm and b.bpm and abs(a.bpm - b.bpm) / a.bpm > 0.02
+    target_bpm = (meet_bpm or a.bpm or 0.0) * tempo_ratio
+    needs_ramp = (
+        a.bpm and b.bpm and abs(target_bpm - b.bpm) / target_bpm > 0.02
+    )
     # Settle before B's own seam-headroom ceiling (a conservative proxy
     # for "before the NEXT transition could start"), shrinking the ramp
     # if the song is short rather than dropping it entirely.
@@ -202,7 +278,7 @@ def _tempo_and_pitch_calls(
             "tool": "set_tempo_ramp", "song": "B",
             "start_time": round(crossfade_end_b, 3),
             "end_time": round(ramp_end_b, 3),
-            "start_bpm": a.bpm, "end_bpm": b.bpm,
+            "start_bpm": target_bpm, "end_bpm": b.bpm,
         })
     elif needs_ramp:
         logger.info(
@@ -387,6 +463,51 @@ def _expand_acapella(
     return stem_calls, duck_calls, total
 
 
+TEASE_GAIN = 0.9
+
+
+def _build_tease_call(
+    a: AnalysisBundle,
+    b: AnalysisBundle,
+    seam_a: float,
+    b_energy_curve: list[float] | None,
+    a_safe_regions: list[dict] | None,
+) -> dict | None:
+    """One vocal_tease call, or None when no clean hook/pocket exists.
+
+    The LLM only opts in (decision.tease); everything here is computed:
+    B's most-repeated vocal line, an instrumental drum-solid pocket late
+    in A, and the semitone shift into A's key (dropped entirely when the
+    shift would exceed the artifact cap — a wrong-key tease is worse
+    than none)."""
+    if not a.bpm or not b.bpm:
+        return None
+    hook = find_hook(b.transcription_segments, b.sections, b_energy_curve)
+    if hook is None:
+        return None
+    # Duration once stretched to A's tempo.
+    hook_dur_out = (hook.end - hook.start) * (b.bpm / a.bpm)
+    pocket = find_pocket(hook_dur_out, seam_a, a_safe_regions, a.envelopes)
+    if pocket is None:
+        return None
+    semitones = 0
+    if not camelot_compatible(a.camelot_key, b.camelot_key):
+        try:
+            semitones = compute_pitch_shift(a.key, b.key)
+        except ValueError:
+            return None
+        if abs(semitones) > PITCH_SHIFT_CAP:
+            return None
+    return {
+        "tool": "vocal_tease", "song": "A",
+        "start_time": pocket,
+        "hook_start": round(hook.start, 3),
+        "hook_end": round(hook.end, 3),
+        "bpm_from": b.bpm, "bpm_to": a.bpm,
+        "semitones": semitones, "gain": TEASE_GAIN,
+    }
+
+
 def _mean_level(curve: list[float] | None, lo_s: float, hi_s: float) -> float | None:
     """Mean of the 1 Hz analysis energy curve over [lo_s, hi_s]."""
     if not curve:
@@ -407,6 +528,7 @@ def _loudness_match_calls(
     crossfade_total_bars: int,
     a_energy_curve: list[float] | None,
     b_energy_curve: list[float] | None,
+    tempo_ratio: float = 1.0,
 ) -> list[dict]:
     """Song-level gain staging: bring B to A's perceived level at the
     seam, then glide back to B's native level after the crossfade.
@@ -443,7 +565,7 @@ def _loudness_match_calls(
                   min(LOUDNESS_MATCH_MAX_BOOST_DB, diff_db))
     gain = round(10.0 ** (diff_db / 20.0), 4)
 
-    crossfade_end_b = seam_b + crossfade_total_bars * spb_b
+    crossfade_end_b = seam_b + crossfade_total_bars * spb_b * tempo_ratio
     ceiling_b = max_seam_time(b.duration, b.bpm, b.time_signature) or b.duration
     recovery_bars = LOUDNESS_RECOVERY_BARS
     while recovery_bars >= 8 and crossfade_end_b + recovery_bars * spb_b > ceiling_b:
@@ -489,6 +611,8 @@ def expand(
     a_energy_curve: list[float] | None = None,
     b_energy_curve: list[float] | None = None,
     loudness_match: bool = True,
+    bass_swap: bool = True,
+    tempo_meet: bool = True,
 ) -> MixPlanJSON:
     """Expand a validated decision into the final tool-call list."""
     out_c = candidates.find(decision.out)
@@ -499,8 +623,36 @@ def expand(
         raise ArchetypeError(f"unknown IN candidate {decision.in_!r}")
 
     seam_a, seam_b = out_c.time, in_c.time
+
+    # Half/double-time trick: when the raw gap is unstretchable but the
+    # BPMs sit near 2:1, beatmatch B at half/double time instead. The
+    # ratio rides on the window so the executor and stitcher share it.
+    tempo_ratio = 1.0
+    if a.bpm and b.bpm and abs(a.bpm - b.bpm) / a.bpm > HALFTIME_MIN_RAW_GAP:
+        tempo_ratio = halftime_ratio(a.bpm, b.bpm)
+        if tempo_ratio != 1.0:
+            logger.info(
+                "archetypes: half-time beatmatch engaged (A %.1f, B %.1f, "
+                "ratio %.1f)", a.bpm, b.bpm, tempo_ratio,
+            )
+
+    # Tempo meet-in-the-middle: split a mid-size gap between both songs.
+    # Mutually exclusive with the half-time trick (which handles the
+    # bigger gaps). A-original-seconds-per-output-bar and B-original-
+    # seconds-per-output-bar are both invariant to the meet tempo, so
+    # the clamp/ramp math below doesn't change — only the emitted A ramp
+    # and B's ramp start tempo do.
+    meet_bpm: float | None = None
+    if (
+        tempo_meet
+        and tempo_ratio == 1.0
+        and a.bpm and b.bpm
+        and TEMPO_MEET_MIN_GAP < abs(a.bpm - b.bpm) / a.bpm <= TEMPO_MEET_MAX_GAP
+    ):
+        meet_bpm = round((a.bpm + b.bpm) / 2.0, 3)
+
     duration = _clamp_duration_bars(
-        decision.normalized_duration(), a, b, seam_a, seam_b
+        decision.normalized_duration(), a, b, seam_a, seam_b, tempo_ratio
     )
     a_fade = decision.normalized_a_fade(duration)
     spb_a = _sec_per_bar(a)
@@ -520,9 +672,26 @@ def expand(
         drums_dur = duration + bridge - drums_start
         # Keep total within the clamp budget.
         total = drums_start + drums_dur
-        room = _clamp_duration_bars(total, a, b, seam_a, seam_b)
+        room = _clamp_duration_bars(total, a, b, seam_a, seam_b, tempo_ratio)
         if total > room:
             drums_dur = max(2, room - drums_start)
+    elif style == TransitionStyle.double_drop:
+        # Both drops ride together through the first half; A bows out by
+        # the midpoint. Bass handling happens on the stem call below —
+        # B's bass owns the drop from bar 0.
+        a_fade = min(a_fade, max(2, duration // 2))
+    elif style == TransitionStyle.backspin:
+        pre_window_calls.append({
+            "tool": "backspin", "song": "A",
+            "start_time": round(seam_a, 3),
+            "duration_beats": BACKSPIN_BEATS,
+            "bpm": a.bpm,
+        })
+        a_fade = min(a_fade, 1)
+    elif style == TransitionStyle.breakdown_blend:
+        # Long dissolve through both songs' quiet stretches; A lingers
+        # most of the window so the swap stays invisible.
+        a_fade = min(a_fade, max(2, (duration * 3) // 4))
     elif style == TransitionStyle.wash_out:
         pre_window_calls.append({
             "tool": "apply_reverb", "song": "A",
@@ -563,7 +732,9 @@ def expand(
     vocal_exit_time = seam_a  # when A's vocal leaves (acapella_in: bar 0)
     extras_to_apply = list(decision.extras)
     if style in ACAPELLA_STYLES:
-        duration = _clamp_duration_bars(duration, a, b, seam_a, seam_b)
+        duration = _clamp_duration_bars(
+            duration, a, b, seam_a, seam_b, tempo_ratio
+        )
         acapella_stem_calls, acapella_duck_calls, acapella_total_bars = (
             _expand_acapella(
                 decision, a, b, seam_a, seam_b, duration,
@@ -647,7 +818,17 @@ def expand(
         stem_calls = _crossfade_calls(
             duration, a_fade,
             drums_start_bar=drums_start, drums_duration_bars=drums_dur,
+            bass_swap=bass_swap and style.value in BASS_SWAP_STYLES,
         )
+        if style == TransitionStyle.double_drop:
+            # Two drop basslines stacking is instant limiter pumping: A's
+            # bass is silent from bar 0 and B's owns the drop, swelling in
+            # over the first bar.
+            for c in stem_calls:
+                if c["stem"] == "bass":
+                    c["start_bar"] = 0
+                    c["duration_bars"] = 1
+                    c["a_fade_out_bars"] = 0
         crossfade_total_bars = max(
             int(c["start_bar"]) + int(c["duration_bars"]) for c in stem_calls
         )
@@ -656,20 +837,60 @@ def expand(
     if loudness_match:
         loudness_calls = _loudness_match_calls(
             a, b, seam_a, seam_b, crossfade_total_bars,
-            a_energy_curve, b_energy_curve,
+            a_energy_curve, b_energy_curve, tempo_ratio,
+        )
+
+    # Hook tease (opt-in via decision.tease): B's hook rides an
+    # instrumental pocket late in A. Acapella styles already put a vocal
+    # front and center — teasing on top would be clutter.
+    if decision.tease and style not in ACAPELLA_STYLES:
+        tease_call = _build_tease_call(
+            a, b, seam_a, b_energy_curve, a_safe_regions
+        )
+        if tease_call is not None:
+            pre_window_calls.append(tease_call)
+            logger.info(
+                "archetypes: teasing B's hook at %.1fs (%.1fs-%.1fs, %+d st)",
+                tease_call["start_time"], tease_call["hook_start"],
+                tease_call["hook_end"], tease_call["semitones"],
+            )
+        else:
+            logger.info("archetypes: tease requested but no hook/pocket fit")
+
+    window_call: dict = {
+        "tool": "set_transition_window",
+        "from_song_time_start": round(seam_a, 3),
+        "to_song_time_start": round(seam_b, 3),
+        "duration_bars": duration,
+    }
+    if tempo_ratio != 1.0:
+        window_call["tempo_ratio"] = tempo_ratio
+
+    meet_calls: list[dict] = []
+    if meet_bpm is not None:
+        meet_calls.append({
+            "tool": "set_tempo_ramp", "song": "A",
+            "start_time": round(
+                max(0.0, seam_a - TEMPO_MEET_RAMP_BARS * spb_a), 3
+            ),
+            "end_time": round(seam_a, 3),
+            "start_bpm": a.bpm, "end_bpm": meet_bpm,
+        })
+        logger.info(
+            "archetypes: tempo meet-in-the-middle at %.1f BPM "
+            "(A %.1f, B %.1f)", meet_bpm, a.bpm, b.bpm,
         )
 
     plan: MixPlanJSON = [
-        {
-            "tool": "set_transition_window",
-            "from_song_time_start": round(seam_a, 3),
-            "to_song_time_start": round(seam_b, 3),
-            "duration_bars": duration,
-        },
+        window_call,
+        *meet_calls,
         *pre_window_calls,
         *extra_calls,
         *loudness_calls,
-        *_tempo_and_pitch_calls(a, b, seam_b, crossfade_total_bars, pitch_mode),
+        *_tempo_and_pitch_calls(
+            a, b, seam_b, crossfade_total_bars, pitch_mode, tempo_ratio,
+            meet_bpm,
+        ),
         *stem_calls,
     ]
     return plan
@@ -684,7 +905,8 @@ def default_decision(candidates: PairCandidates, style: TransitionStyle | None =
     # Prefer a high-energy IN for energetic styles; first candidate else.
     in_c: SeamCandidate = candidates.in_candidates[0]
     if chosen in (TransitionStyle.drop_swap, TransitionStyle.stutter_buildup,
-                  TransitionStyle.acapella_in):
+                  TransitionStyle.acapella_in, TransitionStyle.double_drop,
+                  TransitionStyle.backspin):
         for c in candidates.in_candidates:
             if c.energy >= 0.8:
                 in_c = c
@@ -696,6 +918,12 @@ def default_decision(candidates: PairCandidates, style: TransitionStyle | None =
             if c.vocal_safe:
                 out_c = c
                 break
+    elif chosen == TransitionStyle.double_drop:
+        # Both drops together: A's OUT must itself be a drop.
+        out_c = max(candidates.out_candidates, key=lambda c: c.energy)
+    elif chosen == TransitionStyle.breakdown_blend:
+        # The invisible swap: exit through A's quietest late moment.
+        out_c = min(candidates.out_candidates, key=lambda c: c.energy)
     from app.services.mixer.decision import STYLE_DURATION_CHOICES
 
     duration = STYLE_DURATION_CHOICES[chosen][-1]

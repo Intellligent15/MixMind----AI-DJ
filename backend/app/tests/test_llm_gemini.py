@@ -111,4 +111,4 @@ async def test_gemini_provider_generation():
             # The shared base caches the RAW model response (the {"plan": ...}
             # wrapper), not the unwrapped list — complete_json() is generic
             # and the unwrap happens a layer above.
-            assert written_data["response"] == {"plan": dummy_plan}
+            assert written_data["response"] == dummy_plan

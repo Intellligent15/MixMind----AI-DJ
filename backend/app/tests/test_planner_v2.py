@@ -220,9 +220,14 @@ def test_drum_bridge_offsets_drums():
     decision = default_decision(cands, style=TransitionStyle.drum_bridge)
     plan = expand(decision, a, b, cands)
     drums = next(c for c in plan if c.get("stem") == "drums")
-    others = [c for c in plan if c["tool"] == "crossfade_stem" and c["stem"] != "drums"]
+    # Bass gets the midpoint EQ-swap on long blends; vocals/other share
+    # the full window from bar 0.
+    others = [c for c in plan if c["tool"] == "crossfade_stem"
+              and c["stem"] in ("vocals", "other")]
+    bass = next(c for c in plan if c.get("stem") == "bass")
     assert drums["start_bar"] > 0
     assert all(c["start_bar"] == 0 for c in others)
+    assert bass["start_bar"] > 0 and bass["duration_bars"] == 2
 
 
 def test_stutter_skips_loop_when_not_vocal_safe():
@@ -490,6 +495,25 @@ def test_planner_downgrades_unpinned_acapella_on_key_clash():
     validate_plan(outcome.plan)
 
 
+def test_planner_allows_acapella_on_camelot_compatible_keys():
+    """Keys don't have to be identical for acapella styles — any standard
+    Camelot match (relative major/minor, ±1 on the wheel) must survive the
+    downgrade guard."""
+    for b_key, b_camelot in (("Em", "9A"), ("C", "8B")):  # neighbour, relative
+        a = SongMeta("Track A", "X", make_bundle(key="Am", camelot="8A"),
+                     energy_curve_for(240.0), FULL_SAFE)
+        b = SongMeta("Track B", "Y", make_bundle(key=b_key, camelot=b_camelot),
+                     energy_curve_for(240.0), FULL_SAFE)
+        provider = StubProvider(response={
+            "out": "A1", "in": "B1", "style": "acapella_out", "duration_bars": 12,
+        })
+        outcome = asyncio.run(build_plan_v2(provider, a, b))
+        assert outcome.style == "acapella_out", (
+            f"acapella_out downgraded on Camelot-compatible pair 8A/{b_camelot}"
+        )
+        validate_plan(outcome.plan)
+
+
 def test_planner_honors_pinned_acapella_despite_clash():
     a = SongMeta("Track A", "X", make_bundle(key="Am", camelot="8A"),
                  energy_curve_for(240.0), FULL_SAFE)
@@ -704,3 +728,332 @@ def test_planner_v2_passes_set_position():
         provider, a, b, pair_label="transition 2 of 4",
     ))
     assert "transition 2 of 4" in provider.calls[0]["user"]
+
+
+# ------------------------------------------- candidate densities / LLM input
+
+def _full_envelopes(duration: float, level: float = 0.15) -> dict:
+    n = int(duration * 10)
+    stem = {"rms": [level] * n, "peak": [level * 1.5] * n}
+    return {"frame_hz": 10, "drums": dict(stem), "bass": dict(stem),
+            "other": dict(stem), "vocals": dict(stem)}
+
+
+def _wordy_segments(duration: float) -> list[dict]:
+    words = [
+        {"word": f"w{i}", "start": float(i), "end": i + 0.5, "probability": 0.9}
+        for i in range(int(duration))
+    ]
+    return [{"start": 0.0, "end": duration, "text": "la", "words": words}]
+
+
+def test_unknown_densities_omitted_from_llm_dict():
+    """No safety data and no envelopes → density fields are absent, not 0.0."""
+    b = make_bundle()
+    cands = build_in_candidates(b, energy_curve_for(b.duration), [])
+    assert cands
+    for c in cands:
+        d = c.to_llm_dict()
+        assert "vocal_density" not in d
+        assert "drum_density" not in d
+        assert "bass_density" not in d
+
+
+def test_in_candidates_carry_densities_and_lyrics():
+    """B-side candidates get drum/bass densities and lyric previews when
+    the bundle carries envelopes + transcription (regression: they used
+    to be hardcoded 0.0/None on the in side)."""
+    import dataclasses
+
+    b = dataclasses.replace(
+        make_bundle(),
+        envelopes=_full_envelopes(240.0),
+        transcription_segments=_wordy_segments(240.0),
+    )
+    cands = build_in_candidates(b, energy_curve_for(b.duration), FULL_SAFE)
+    assert cands
+    for c in cands:
+        assert c.drum_density == pytest.approx(1.0)
+        assert c.bass_density == pytest.approx(1.0)
+        assert c.lyrics_preview  # words exist throughout the song
+        d = c.to_llm_dict()
+        assert d["drum_density"] == 1.0
+        assert d["bass_density"] == 1.0
+
+
+def test_song_llm_input_includes_tags():
+    import dataclasses
+
+    from app.services.mixer.planner_v2 import _song_llm_input
+
+    tags = {"genres": ["house"], "moods": ["energetic"]}
+    bundle = dataclasses.replace(make_bundle(), tags=tags)
+    meta = SongMeta("T", "A", bundle, energy_curve_for(240.0), FULL_SAFE)
+    assert _song_llm_input(meta, [])["tags"] == tags
+
+    untagged = SongMeta("T", "A", make_bundle(), energy_curve_for(240.0), FULL_SAFE)
+    assert "tags" not in _song_llm_input(untagged, [])
+
+
+# ---------------------------------------------------------------- bass swap
+
+def _bass_call(plan: list[dict]) -> dict:
+    return next(
+        c for c in plan
+        if c["tool"] == "crossfade_stem" and c["stem"] == "bass"
+    )
+
+
+def test_bass_swap_on_long_blend():
+    """smooth_blend >= 8 bars: the bass stem hands over in a 2-bar window
+    at the crossfade midpoint instead of blending the whole way."""
+    a, b = make_bundle(), make_bundle()
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    decision = default_decision(cands, style=TransitionStyle.smooth_blend)
+    duration = decision.normalized_duration()
+    plan = expand(decision, a, b, cands)
+    bass = _bass_call(plan)
+    assert bass["duration_bars"] == 2
+    assert bass["start_bar"] == min(duration // 2, decision.normalized_a_fade(duration)) - 1
+    assert bass["a_fade_out_bars"] == 1
+    # The other full-window stems are untouched.
+    vocals = next(c for c in plan
+                  if c["tool"] == "crossfade_stem" and c["stem"] == "vocals")
+    assert vocals["start_bar"] == 0
+    assert vocals["duration_bars"] == duration
+
+
+def test_bass_swap_skipped_for_short_styles():
+    a, b = make_bundle(), make_bundle()
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    decision = default_decision(cands, style=TransitionStyle.drop_swap)
+    plan = expand(decision, a, b, cands)
+    bass = _bass_call(plan)
+    assert bass["start_bar"] == 0
+    assert bass["duration_bars"] == decision.normalized_duration()
+
+
+def test_bass_swap_disabled_restores_coupled_fade():
+    a, b = make_bundle(), make_bundle()
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    decision = default_decision(cands, style=TransitionStyle.smooth_blend)
+    plan = expand(decision, a, b, cands, bass_swap=False)
+    bass = _bass_call(plan)
+    assert bass["start_bar"] == 0
+    assert bass["duration_bars"] == decision.normalized_duration()
+
+
+def test_bass_swap_never_outlives_a_fade():
+    """When the decision cuts A out early, A's bass must not ride alone
+    past the rest of A."""
+    a, b = make_bundle(), make_bundle()
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    base = default_decision(cands, style=TransitionStyle.smooth_blend)
+    decision = base.model_copy(update={"duration_bars": 16, "a_fade_out_bars": 4})
+    plan = expand(decision, a, b, cands)
+    bass = _bass_call(plan)
+    # Handover is pulled forward to A's exit (bar 4), not the midpoint (8).
+    assert bass["start_bar"] + bass["a_fade_out_bars"] <= 4
+
+
+# ----------------------------------------------------------- new archetypes
+
+def test_halftime_ratio_detection():
+    from app.services.mixer.archetypes import halftime_ratio
+    assert halftime_ratio(85.0, 170.0) == 2.0     # B double-time
+    assert halftime_ratio(85.0, 172.0) == 2.0     # within 4%
+    assert halftime_ratio(170.0, 85.0) == 0.5     # B half-time
+    assert halftime_ratio(120.0, 128.0) == 1.0    # ordinary gap
+    assert halftime_ratio(85.0, 120.0) == 1.0     # nowhere near 2:1
+    assert halftime_ratio(None, 120.0) == 1.0
+
+
+def test_expand_stamps_tempo_ratio_for_halftime_pair():
+    a = make_bundle(bpm=85.0)
+    b = make_bundle(bpm=170.0)
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    decision = default_decision(cands, style=TransitionStyle.drum_bridge)
+    plan = expand(decision, a, b, cands)
+    validate_plan(plan)
+    window = plan[0]
+    assert window["tempo_ratio"] == 2.0
+    # 85 * 2 == 170 exactly -> B needs no post-crossfade tempo ramp at all.
+    assert not any(c["tool"] == "set_tempo_ramp" for c in plan)
+
+
+def test_expand_no_ratio_for_ordinary_gap():
+    a, b = make_bundle(bpm=120.0), make_bundle(bpm=126.0)
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    plan = expand(default_decision(cands), a, b, cands)
+    assert "tempo_ratio" not in plan[0]
+
+
+def test_double_drop_expansion_gives_b_the_bass():
+    a, b = make_bundle(), make_bundle()
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    decision = default_decision(cands, style=TransitionStyle.double_drop)
+    plan = expand(decision, a, b, cands)
+    validate_plan(plan)
+    bass = next(c for c in plan
+                if c["tool"] == "crossfade_stem" and c["stem"] == "bass")
+    assert bass["start_bar"] == 0
+    assert bass["duration_bars"] == 1
+    assert bass["a_fade_out_bars"] == 0   # A's bass never stacks on B's drop
+
+
+def test_backspin_expansion_emits_tool_at_seam():
+    a, b = make_bundle(), make_bundle()
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    decision = default_decision(cands, style=TransitionStyle.backspin)
+    plan = expand(decision, a, b, cands)
+    validate_plan(plan)
+    spin = next(c for c in plan if c["tool"] == "backspin")
+    assert spin["song"] == "A"
+    assert spin["start_time"] == plan[0]["from_song_time_start"]
+    assert spin["duration_beats"] == 4.0
+
+
+def test_breakdown_blend_is_long_and_bass_swapped():
+    a, b = make_bundle(), make_bundle()
+    cands = build_pair_candidates(
+        a, b, energy_curve_for(a.duration), energy_curve_for(b.duration),
+        FULL_SAFE, FULL_SAFE,
+    )
+    decision = default_decision(cands, style=TransitionStyle.breakdown_blend)
+    plan = expand(decision, a, b, cands)
+    validate_plan(plan)
+    assert plan[0]["duration_bars"] == 16
+    bass = next(c for c in plan
+                if c["tool"] == "crossfade_stem" and c["stem"] == "bass")
+    assert bass["duration_bars"] == 2   # midpoint EQ swap
+
+
+def test_out_candidates_offer_drop_and_breakdown():
+    a = make_bundle()  # 5 sections of 48 s each
+    # Section energies: quiet intro, a real drop in section 2 (before the
+    # late-3 window), then a fading tail below the breakdown threshold.
+    curve = [0.2] * 48 + [1.0] * 48 + [0.6] * 48 + [0.3] * 48 + [0.15] * 48
+    cands = build_out_candidates(a, curve, FULL_SAFE)
+    descs = " | ".join(c.description for c in cands)
+    assert "last drop/chorus" in descs
+    assert "final breakdown" in descs
+    drop = next(c for c in cands if "drop/chorus" in c.description)
+    assert drop.energy >= 0.8
+
+
+def test_planner_downgrades_double_drop_on_key_clash():
+    a = SongMeta("A", "X", make_bundle(key="Am", camelot="8A"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    b = SongMeta("B", "Y", make_bundle(key="C#m", camelot="12A"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "double_drop", "duration_bars": 8,
+    })
+    outcome = asyncio.run(build_plan_v2(provider, a, b))
+    assert outcome.style == "drop_swap"
+    validate_plan(outcome.plan)
+
+
+def test_planner_allows_double_drop_when_both_seams_are_drops():
+    a_bundle, b_bundle = make_bundle(), make_bundle()
+    a_curve = energy_curve_for(240.0, peak_at=0.8)   # A peaks late
+    b_curve = energy_curve_for(240.0, peak_at=0.2)   # B peaks early
+    cands = build_pair_candidates(
+        a_bundle, b_bundle, a_curve, b_curve, FULL_SAFE, FULL_SAFE
+    )
+    out_id = max(cands.out_candidates, key=lambda c: c.energy).id
+    in_id = max(cands.in_candidates, key=lambda c: c.energy).id
+    a = SongMeta("A", "X", a_bundle, a_curve, FULL_SAFE)
+    b = SongMeta("B", "Y", b_bundle, b_curve, FULL_SAFE)
+    provider = StubProvider(response={
+        "out": out_id, "in": in_id, "style": "double_drop", "duration_bars": 8,
+    })
+    outcome = asyncio.run(build_plan_v2(provider, a, b))
+    assert outcome.style == "double_drop"
+    validate_plan(outcome.plan)
+
+
+def test_planner_downgrades_vinyl_stop_on_mixable_pair():
+    """vinyl_stop on a pair that could perfectly well blend (tight tempo,
+    compatible keys) is showing off — downgraded to drop_swap."""
+    a = SongMeta("A", "X", make_bundle(bpm=124.0, key="C", camelot="8B"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    b = SongMeta("B", "Y", make_bundle(bpm=126.0, key="G", camelot="9B"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "vinyl_stop", "duration_bars": 4,
+    })
+    outcome = asyncio.run(build_plan_v2(provider, a, b))
+    assert outcome.style == "drop_swap"
+    validate_plan(outcome.plan)
+
+
+def test_planner_allows_vinyl_stop_when_justified():
+    """A 25% tempo gap with no half-time relationship AND a beyond-cap key
+    clash: nothing can blend this — the full stop is the honest move."""
+    a = SongMeta("A", "X", make_bundle(bpm=100.0, key="Am", camelot="8A"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    b = SongMeta("B", "Y", make_bundle(bpm=125.0, key="C#m", camelot="12A"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "vinyl_stop", "duration_bars": 4,
+    })
+    outcome = asyncio.run(build_plan_v2(provider, a, b))
+    assert outcome.style == "vinyl_stop"
+    validate_plan(outcome.plan)
+
+
+def test_planner_blocks_second_theatric_per_set():
+    """Even a justified vinyl_stop is downgraded when the set already
+    used a vinyl_stop or backspin — once per set, mechanically."""
+    a = SongMeta("A", "X", make_bundle(bpm=100.0, key="Am", camelot="8A"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    b = SongMeta("B", "Y", make_bundle(bpm=125.0, key="C#m", camelot="12A"),
+                 energy_curve_for(240.0), FULL_SAFE)
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "vinyl_stop", "duration_bars": 4,
+    })
+    outcome = asyncio.run(build_plan_v2(
+        provider, a, b, previous_styles=["smooth_blend", "backspin"],
+    ))
+    assert outcome.style == "drop_swap"
+    validate_plan(outcome.plan)
+
+
+def test_planner_honors_pinned_vinyl_stop():
+    a = SongMeta("A", "X", make_bundle(bpm=124.0), energy_curve_for(240.0),
+                 FULL_SAFE)
+    b = SongMeta("B", "Y", make_bundle(bpm=126.0), energy_curve_for(240.0),
+                 FULL_SAFE)
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "smooth_blend", "duration_bars": 16,
+    })
+    outcome = asyncio.run(build_plan_v2(
+        provider, a, b, style_override="vinyl_stop",
+    ))
+    assert outcome.style == "vinyl_stop"   # the user's call, always
+    validate_plan(outcome.plan)

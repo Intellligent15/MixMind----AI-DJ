@@ -26,6 +26,7 @@ the row — a fallback is never silent again.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import tempfile
@@ -40,6 +41,7 @@ from app.models import (
     Analysis,
     MixPlan,
     MixPlanStatus,
+    Queue,
     QueueItem,
     Song,
     SongStatus,
@@ -50,10 +52,13 @@ from app.models.lyrics import Lyrics, LyricsAlignmentStatus
 from app.services.llm import get_llm_provider
 from app.services.mixer.candidates import enrich_sections, max_seam_time
 from app.services.mixer.executor import render
+from app.services.feedback.summary import feedback_context
+from app.services.mixer.occasions import occasion_context
 from app.services.mixer.plan import build_pair_plan
 from app.services.mixer.pitch_resolver import effective_bundle
 from app.services.mixer.planner_v2 import PlanOutcome, SongMeta, build_plan_v2
 from app.services.mixer.preshift import ensure_pitched_inputs
+from app.services.mixer.qa import score_render
 from app.services.mixer.types import AnalysisBundle, SongRenderInputs
 from app.services.mixer.validation import (
     enforce_revert_after_crossfade,
@@ -90,6 +95,9 @@ def _to_bundle(analysis: Analysis, duration: float) -> AnalysisBundle:
         downbeats=list(analysis.downbeats),
         sections=list(analysis.sections),
         duration=duration,
+        envelopes=None,
+        transcription_segments=None,
+        tags=analysis.tags,
     )
 
 
@@ -207,8 +215,8 @@ def render_transition(mix_plan_id: str) -> str | None:
         a_title, a_artist = a.title, a.artist
         b_title, b_artist = b.title, b.artist
 
-        a_envelope_path = a_stems.vocal_envelope_path
-        b_envelope_path = b_stems.vocal_envelope_path
+        a_envelope_path = a_stems.envelopes_path
+        b_envelope_path = b_stems.envelopes_path
 
         # `energy_curve` is sampled at 1Hz in the analyzer; we average it
         # per section so structure and energy arrive together.
@@ -219,6 +227,41 @@ def render_transition(mix_plan_id: str) -> str | None:
         style_hint = row.style_hint
         style_override = row.style_override
         reroll_nonce = row.reroll_nonce or 0
+        # Occasion / vibe / energy-dial context for the decision prompt.
+        queue_row = db.get(Queue, row.queue_id)
+        tease_enabled = bool(queue_row.tease_hooks) if queue_row else False
+        extra_context = occasion_context(
+            queue_row.occasion if queue_row else None,
+            queue_row.vibe_note if queue_row else None,
+        )
+        if row.energy_bias == "up":
+            extra_context["energy_dial"] = (
+                "The listener just asked to RAISE the energy: prefer "
+                "high-energy IN candidates and energetic styles "
+                "(drop_swap, stutter_buildup, double_drop), shorter blends."
+            )
+        elif row.energy_bias == "down":
+            extra_context["energy_dial"] = (
+                "The listener just asked to COOL things down: prefer "
+                "low-energy IN candidates and gentle styles "
+                "(breakdown_blend, wash_out, long smooth_blend)."
+            )
+        # Reaction history (F5): what this listener liked/disliked/skipped.
+        try:
+            def _genre(analysis):
+                tags = analysis.tags or {}
+                genres = tags.get("genres") or []
+                return genres[0] if genres else None
+
+            fb_line = feedback_context(db, _genre(a_analysis), _genre(b_analysis))
+            if fb_line:
+                extra_context["listener_feedback"] = fb_line
+        except Exception:  # feedback must never block a render
+            logger.warning("render_transition: feedback summary failed",
+                           exc_info=True)
+        # Style of a cached plan_json, for QA's dropout exemption and the
+        # avoid-list when a cached plan fails QA.
+        existing_style = row.style
 
         # Styles of this queue's other already-planned pairs, in QUEUE
         # ORDER, so the per-pair decision can avoid repeating the same
@@ -258,58 +301,83 @@ def render_transition(mix_plan_id: str) -> str | None:
             if this_pos is not None else None
         )
 
-    async def _fetch_safe_regions(transcription, lyrics, envelope_path, duration):
+    async def _fetch_safe_regions_and_envelope(transcription, lyrics, envelope_path, duration):
         if not transcription or not envelope_path:
-            return []
+            return [], None
         try:
             envelope_data = await storage.read(envelope_path)
             envelope = json.loads(envelope_data.decode("utf-8"))
         except Exception:
-            return []
+            return [], None
 
         aligned_words = None
         if lyrics and lyrics.alignment_status == LyricsAlignmentStatus.success:
             aligned_words = lyrics.aligned_words
 
-        return vocal_safe_regions(
+        safe_regions = vocal_safe_regions(
             transcription_segments=transcription.segments,
             envelope=envelope,
             aligned_words=aligned_words,
             duration_seconds=duration or 0.0,
         )
+        return safe_regions, envelope
 
-    async def _build_plan() -> PlanOutcome:
-        a_eff = effective_bundle(a_bundle, a_pitch_offset)
-        b_eff = effective_bundle(b_bundle, b_pitch_offset)
+    async def _build_plan(
+        avoid_styles: list[str] | None = None, nonce: int | None = None
+    ) -> PlanOutcome:
+        nonlocal a_bundle, b_bundle
 
         if not settings.use_llm_planner:
             return PlanOutcome(
-                plan=build_pair_plan(a_eff, b_eff),
+                plan=build_pair_plan(
+                    effective_bundle(a_bundle, a_pitch_offset),
+                    effective_bundle(b_bundle, b_pitch_offset),
+                ),
                 source="deterministic", style=None, rationale=None,
             )
 
-        a_regions = await _fetch_safe_regions(
+        a_safe_regions, a_env = await _fetch_safe_regions_and_envelope(
             a_transcription, a_lyrics, a_envelope_path, a_bundle.duration
         )
-        b_regions = await _fetch_safe_regions(
+        b_safe_regions, b_env = await _fetch_safe_regions_and_envelope(
             b_transcription, b_lyrics, b_envelope_path, b_bundle.duration
         )
+
+        a_bundle = dataclasses.replace(
+            a_bundle,
+            envelopes=a_env,
+            transcription_segments=a_transcription.segments if a_transcription else None,
+        )
+        b_bundle = dataclasses.replace(
+            b_bundle,
+            envelopes=b_env,
+            transcription_segments=b_transcription.segments if b_transcription else None,
+        )
+
+        a_eff = effective_bundle(a_bundle, a_pitch_offset)
+        b_eff = effective_bundle(b_bundle, b_pitch_offset)
+
         provider = get_llm_provider()
 
         if settings.planner_version == "v2":
             return await build_plan_v2(
                 provider,
                 SongMeta(a_title, a_artist, a_bundle, a_energy_curve,
-                         a_regions, pitch_offset=a_pitch_offset),
+                         a_safe_regions, pitch_offset=a_pitch_offset),
                 SongMeta(b_title, b_artist, b_bundle, b_energy_curve,
-                         b_regions, pitch_offset=b_pitch_offset),
+                         b_safe_regions, pitch_offset=b_pitch_offset),
                 style_hint=style_hint,
                 style_override=style_override,
                 previous_styles=previous_styles,
                 pair_label=pair_label,
-                nonce=reroll_nonce,
+                nonce=nonce if nonce is not None else reroll_nonce,
                 pitch_mode=settings.pitch_mode,
                 loudness_match=settings.loudness_match,
+                avoid_styles=avoid_styles,
+                bass_swap=settings.bass_swap,
+                tempo_meet=settings.tempo_meet_in_middle,
+                extra_context=extra_context,
+                tease_enabled=tease_enabled,
             )
 
         # ---- legacy free-form path, with repair-not-reject ----
@@ -317,13 +385,13 @@ def render_transition(mix_plan_id: str) -> str | None:
             "analysis": _bundle_to_legacy_llm_dict(
                 a_eff, a_energy_curve, a_title, a_artist
             ),
-            "vocal_safe_regions": a_regions,
+            "vocal_safe_regions": a_safe_regions,
         }
         b_llm_input = {
             "analysis": _bundle_to_legacy_llm_dict(
                 b_eff, b_energy_curve, b_title, b_artist
             ),
-            "vocal_safe_regions": b_regions,
+            "vocal_safe_regions": b_safe_regions,
         }
         try:
             plan = await provider.plan_transition(
@@ -354,18 +422,18 @@ def render_transition(mix_plan_id: str) -> str | None:
             mix_plan_id, outcome.source, outcome.style,
         )
 
-    # Outside "temporary" mode no plan may carry pitch tools: whole-song
-    # mode pre-shifts the audio itself (a leftover tool would double-
-    # shift) and "off" mode accepts clashes (a leftover tool would
-    # glide). Covers legacy-prompt output, deterministic fallbacks on a
-    # clash, and cached pre-migration plans alike.
-    plan_for_render = outcome.plan
-    if settings.pitch_mode != "temporary":
-        plan_for_render = strip_pitch_tools(plan_for_render)
+    def _finalize_plan(plan: list[dict]) -> list[dict]:
+        # Outside "temporary" mode no plan may carry pitch tools: whole-song
+        # mode pre-shifts the audio itself (a leftover tool would double-
+        # shift) and "off" mode accepts clashes (a leftover tool would
+        # glide). Covers legacy-prompt output, deterministic fallbacks on a
+        # clash, and cached pre-migration plans alike. Then guarantee B's
+        # tempo/pitch revert only fires once the crossfade is done.
+        if settings.pitch_mode != "temporary":
+            plan = strip_pitch_tools(plan)
+        return enforce_revert_after_crossfade(plan, b_bundle)
 
-    # Guarantee B's tempo/pitch revert only fires once the crossfade is
-    # done, whatever the source of the plan (fresh, cached, or fallback).
-    plan_json = enforce_revert_after_crossfade(plan_for_render, b_bundle)
+    plan_json = _finalize_plan(outcome.plan)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -423,6 +491,60 @@ def render_transition(mix_plan_id: str) -> str | None:
             _mark_failed(plan_uuid, f"{type(exc).__name__}: {exc}")
             return None
 
+        # Render QA: score the output; on a hard fail, re-plan ONCE with
+        # the failed style excluded and keep whichever render scores
+        # better. A user style pin is honored as-is (their call), and the
+        # retry needs the v2 LLM path to produce a different plan at all.
+        style_for_qa = outcome.style or existing_style
+        qa = score_render(result.wav_bytes, plan_json, a_bundle, style=style_for_qa)
+        adopted_retry_nonce: int | None = None
+        if (
+            qa.verdict == "fail"
+            and settings.use_llm_planner
+            and settings.planner_version == "v2"
+            and not style_override
+        ):
+            logger.warning(
+                "render_transition: %s failed QA (%s); re-planning once",
+                mix_plan_id, ", ".join(qa.flags),
+            )
+            try:
+                retry_outcome = asyncio.run(_build_plan(
+                    avoid_styles=[s for s in (style_for_qa,) if s],
+                    nonce=reroll_nonce + 1,
+                ))
+                retry_plan = _finalize_plan(retry_outcome.plan)
+                retry_result = render(retry_plan, a_inputs, b_inputs)
+                retry_qa = score_render(
+                    retry_result.wav_bytes, retry_plan, a_bundle,
+                    style=retry_outcome.style,
+                )
+                if not retry_qa.worse_than(qa):
+                    result, qa = retry_result, retry_qa
+                    plan_json, outcome = retry_plan, retry_outcome
+                    # Persisted below so future rerolls' LLM cache keys
+                    # move past the plan QA already rejected.
+                    adopted_retry_nonce = reroll_nonce + 1
+                    logger.info(
+                        "render_transition: %s QA retry adopted (style=%s, "
+                        "verdict=%s)", mix_plan_id, outcome.style, qa.verdict,
+                    )
+                else:
+                    logger.info(
+                        "render_transition: %s QA retry scored worse (%s); "
+                        "keeping original", mix_plan_id, retry_qa.verdict,
+                    )
+            except Exception:
+                logger.exception(
+                    "render_transition: %s QA retry errored; keeping "
+                    "original render", mix_plan_id,
+                )
+        if qa.verdict != "pass":
+            logger.warning(
+                "render_transition: %s shipping with QA verdict=%s (%s)",
+                mix_plan_id, qa.verdict, ", ".join(qa.flags),
+            )
+
     # Phase 4: persist output via storage, flip to ready.
     key = f"mixes/{mix_plan_id}.wav"
     asyncio.run(storage.write(key, result.wav_bytes))
@@ -435,6 +557,10 @@ def render_transition(mix_plan_id: str) -> str | None:
         row.rendered_audio_path = key
         row.status = MixPlanStatus.ready
         row.error_text = None
+        row.qa_metrics = {"flags": qa.flags, **qa.metrics}
+        row.qa_verdict = qa.verdict
+        if adopted_retry_nonce is not None:
+            row.reroll_nonce = adopted_retry_nonce
         if outcome.source != "cached":
             row.plan_source = outcome.source
             row.style = outcome.style
