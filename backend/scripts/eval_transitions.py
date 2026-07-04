@@ -47,6 +47,7 @@ from app.services.mixer.executor import (
 )
 from app.services.mixer.pitch_resolver import SongKey, resolve_pitch_offsets
 from app.services.mixer.plan import build_pair_plan
+from app.services.mixer.qa import score_render
 from app.services.mixer.planner_v2 import SongMeta, build_plan_v2
 from app.services.mixer.preshift import ensure_pitched_inputs
 from app.services.mixer.types import AnalysisBundle, SongRenderInputs
@@ -59,38 +60,31 @@ from app.services.vocal_safety.safety import vocal_safe_regions
 from app.workers.render_transition import _to_bundle
 
 
-def _seam_metrics(wav_bytes: bytes, plan: list[dict], a_bundle: AnalysisBundle) -> dict:
+def _seam_metrics(
+    wav_bytes: bytes, plan: list[dict], a_bundle: AnalysisBundle,
+    style: str | None = None,
+) -> dict:
+    """QA report (single source of truth: services/mixer/qa.py) plus the
+    eval-only low-band onset correlation across the seam."""
+    report = score_render(wav_bytes, plan, a_bundle, style=style)
+
     audio, sr = sf.read(io.BytesIO(wav_bytes), always_2d=True, dtype="float32")
-    window = next(c for c in plan if c["tool"] == "set_transition_window")
-    seam = float(window["from_song_time_start"])
-    seam_samp = int(seam * sr)
+    seam_samp = int(float(report.metrics.get("seam_s", 0.0)) * sr)
     spb = (60.0 / a_bundle.bpm) * a_bundle.time_signature
     two_bars = int(2 * spb * sr)
-
-    pre = audio[max(0, seam_samp - two_bars): seam_samp]
-    post = audio[seam_samp: seam_samp + two_bars]
-
-    def _rms_db(x: np.ndarray) -> float:
-        if x.size == 0:
-            return float("-inf")
-        r = float(np.sqrt(np.mean(x ** 2)))
-        return 20.0 * np.log10(max(r, 1e-9))
-
-    pre_env = _low_band_onset(pre, sr)
-    post_env = _low_band_onset(post, sr)
+    pre_env = _low_band_onset(audio[max(0, seam_samp - two_bars): seam_samp], sr)
+    post_env = _low_band_onset(audio[seam_samp: seam_samp + two_bars], sr)
     onset_corr = (
         _norm_corr(pre_env, post_env)
         if pre_env is not None and post_env is not None else float("nan")
     )
 
     return {
-        "duration_s": round(audio.shape[0] / sr, 2),
-        "seam_s": round(seam, 2),
-        "rms_pre_db": round(_rms_db(pre), 2),
-        "rms_post_db": round(_rms_db(post), 2),
-        "rms_delta_db": round(abs(_rms_db(pre) - _rms_db(post)), 2),
+        **report.metrics,
         "seam_lowband_onset_corr": round(float(onset_corr), 3),
         "peak": round(float(np.max(np.abs(audio))), 4),
+        "qa_verdict": report.verdict,
+        "qa_flags": report.flags,
     }
 
 
@@ -119,10 +113,10 @@ async def _load_song(db, song_id: uuid.UUID, storage, tmp: Path, prefix: str):
     )
     lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_id))
     regions = []
-    if transcription and stems.vocal_envelope_path:
+    if transcription and stems.envelopes_path:
         try:
             env = json.loads(
-                (await storage.read(stems.vocal_envelope_path)).decode("utf-8")
+                (await storage.read(stems.envelopes_path)).decode("utf-8")
             )
             aligned = (
                 lyrics.aligned_words
@@ -206,7 +200,9 @@ async def _eval_pair(from_id: uuid.UUID, to_id: uuid.UUID,
         v2 = render(v2_plan, a_inputs, b_inputs)
         v2_path = out_dir / f"{pair_tag}__v2_{outcome.style or 'fallback'}.wav"
         v2_path.write_bytes(v2.wav_bytes)
-        v2_metrics = _seam_metrics(v2.wav_bytes, v2_plan, a_meta.bundle)
+        v2_metrics = _seam_metrics(
+            v2.wav_bytes, v2_plan, a_meta.bundle, style=outcome.style
+        )
         print(f"[planner v2] source={outcome.source} style={outcome.style}")
         if outcome.rationale:
             print(f"  rationale: {outcome.rationale}")

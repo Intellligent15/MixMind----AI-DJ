@@ -25,5 +25,7 @@ class MixPlanRead(BaseModel):
     style_hint: str | None = None
     style_override: str | None = None
     reroll_nonce: int = 0
+    qa_metrics: dict | None = None
+    qa_verdict: str | None = None
     created_at: datetime
     updated_at: datetime

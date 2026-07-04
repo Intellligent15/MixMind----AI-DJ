@@ -85,6 +85,18 @@ class MixPlan(Base):
         Integer, nullable=False, server_default="0", default=0
     )
 
+    # Live energy dial (F6): "up" | "down" when the listener asked to bend
+    # the remaining set mid-playback; fed to the planner as context on the
+    # re-render. Null = no bias.
+    energy_bias: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Render QA (services/mixer/qa.py): metrics dict + flags from the last
+    # render, and its verdict ("pass" | "warn" | "fail"). A "fail" here
+    # means the auto-reroll budget was exhausted and the render shipped
+    # anyway — surfaced as a badge in the debug UI, never a hard error.
+    qa_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    qa_verdict: Mapped[str | None] = mapped_column(String, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

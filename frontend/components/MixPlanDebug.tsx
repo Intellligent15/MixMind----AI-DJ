@@ -89,13 +89,28 @@ export function MixPlanDebug({
           <h2 className="font-semibold">Transition</h2>
           <p className="text-xs opacity-70 truncate">→ {nextTitle}</p>
         </div>
-        <span
-          className={
-            "text-xs px-2 py-1 rounded " + statusBadgeClass(plan.status)
-          }
-        >
-          {plan.status}
-        </span>
+        <div className="flex items-center gap-1.5">
+          {plan.qa_verdict && plan.qa_verdict !== "pass" && (
+            <span
+              title={(plan.qa_metrics?.flags ?? []).join(", ")}
+              className={
+                "text-xs px-2 py-1 rounded " +
+                (plan.qa_verdict === "fail"
+                  ? "bg-red-500/30"
+                  : "bg-amber-500/30")
+              }
+            >
+              QA: {plan.qa_verdict}
+            </span>
+          )}
+          <span
+            className={
+              "text-xs px-2 py-1 rounded " + statusBadgeClass(plan.status)
+            }
+          >
+            {plan.status}
+          </span>
+        </div>
       </header>
 
       <div className="flex items-center gap-2">
@@ -125,6 +140,17 @@ export function MixPlanDebug({
         <pre className="text-xs text-red-700 dark:text-red-400 whitespace-pre-wrap break-words border border-red-500/30 rounded p-2 bg-red-500/5">
           {plan.error_text}
         </pre>
+      )}
+
+      {plan.qa_metrics && (
+        <details className="text-xs">
+          <summary className="cursor-pointer opacity-70 hover:opacity-100">
+            Render QA ({plan.qa_verdict ?? "—"})
+          </summary>
+          <pre className="mt-2 max-h-48 overflow-auto border rounded p-2 bg-black/5 dark:bg-white/5 whitespace-pre-wrap break-words">
+            {JSON.stringify(plan.qa_metrics, null, 2)}
+          </pre>
+        </details>
       )}
 
       <details className="text-xs">
