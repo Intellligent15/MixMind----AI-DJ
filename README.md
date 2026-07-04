@@ -11,14 +11,14 @@ It's a local‑first, single‑user web app: everything runs on your own machine
 1. **Search & queue** — search YouTube, add songs, drag to order, lock the queue.
 2. **Analyse each track** — download audio, detect BPM / key / beat grid / sections / energy, split into 4 stems (vocals, drums, bass, other), transcribe the vocal, and align lyrics.
 3. **Design transitions** — for every adjacent pair, an LLM plans a transition as a sequence of mixing "tool calls," guided by both songs' structure and the regions where vocals are/aren't present (so cuts never chop a word).
-4. **Render & stitch** — a deterministic mixer interprets those tool calls (time‑stretch to beatmatch, downbeat‑aligned per‑stem crossfades, pitch handling, effects) and stitches all transitions and songs into one continuous FLAC.
+4. **Render & stitch** — a deterministic mixer interprets those tool calls (time‑stretch to beatmatch, downbeat‑aligned per‑stem crossfades, pitch handling, effects) and stitches all transitions and songs into one continuous M4A (256 kbps AAC).
 5. **Play** — the player streams the continuous mix with a live indicator of the current track and the transition in progress, plus a per‑song hard‑cut fallback.
 
 ## How it works (high level)
 
 ```
 YouTube search ─▶ Queue ─▶ per-song pipeline ─▶ per-pair LLM plan ─▶ render ─▶ stitch ─▶ Player
-                            (download →            (tool-call list)    (numpy +    (one FLAC)
+                            (download →            (tool-call list)    (numpy +    (one M4A)
                              analyze →                                  rubberband)
                              stem-separate →
                              transcribe →
@@ -106,7 +106,7 @@ docker compose down -v # To full wipe past data from container
 
 1. On the home page, **search** for a song and add it to the queue. Add a few and **drag to reorder**.
 2. Click **Done** to lock the queue. The **Processing** view shows each song moving through the pipeline and each transition rendering; failures surface inline with a **Retry**.
-3. When the continuous mix is ready it advances to the **Player**, which streams the stitched set and shows the active transition. You can also download the mix as a FLAC, or switch to per‑song "Queue Mode."
+3. When the continuous mix is ready it advances to the **Player**, which streams the stitched set and shows the active transition. You can also download the mix as an M4A, or switch to per‑song "Queue Mode."
 
 ## Tests
 
