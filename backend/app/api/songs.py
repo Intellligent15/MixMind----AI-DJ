@@ -24,6 +24,7 @@ from app.workers import (
     PRI_DOWNLOAD,
     PRI_SEPARATE,
     PRI_TRANSCRIBE,
+    PRI_TAG,
     celery_app,
 )
 from app.workers.analyze import analyze_song
@@ -34,6 +35,7 @@ from app.workers.download import download_song
 # in torch + demucs + mlx-whisper, which only the native worker needs.
 SEPARATE_TASK = "app.workers.separate.separate_stems"
 TRANSCRIBE_TASK = "app.workers.transcribe.transcribe_song"
+TAG_TASK = "tag_audio"
 # Mirrors STEM_NAMES in app.services.stems (kept inline so the API doesn't
 # import the stems service module either — same reason as above).
 STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "other")
@@ -315,6 +317,8 @@ def retry_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Song:
         db.scalar(select(Transcription.id).where(Transcription.song_id == song_id))
         is not None
     )
+    analysis = db.scalar(select(Analysis).where(Analysis.song_id == song_id))
+    has_tags = analysis is not None and analysis.tags is not None
 
     song.pipeline_requested = True
     song.error_text = None
@@ -325,14 +329,18 @@ def retry_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Song:
         download_song.apply_async(args=[sid], priority=PRI_DOWNLOAD)
     elif not has_analysis:
         analyze_song.apply_async(args=[sid], priority=PRI_ANALYZE)
-    elif not has_stems:
-        celery_app.send_task(SEPARATE_TASK, args=[sid], priority=PRI_SEPARATE)
-    elif not has_transcription:
-        celery_app.send_task(TRANSCRIBE_TASK, args=[sid], priority=PRI_TRANSCRIBE)
     else:
-        # Everything present but the song is failed — re-run the cheapest
-        # terminal stage to settle it back to `ready`.
-        celery_app.send_task(TRANSCRIBE_TASK, args=[sid], priority=PRI_TRANSCRIBE)
+        if not has_tags:
+            celery_app.send_task(TAG_TASK, args=[sid], priority=PRI_TAG)
+
+        if not has_stems:
+            celery_app.send_task(SEPARATE_TASK, args=[sid], priority=PRI_SEPARATE)
+        elif not has_transcription:
+            celery_app.send_task(TRANSCRIBE_TASK, args=[sid], priority=PRI_TRANSCRIBE)
+        else:
+            # Everything present but the song is failed — re-run the cheapest
+            # terminal stage to settle it back to `ready`.
+            celery_app.send_task(TRANSCRIBE_TASK, args=[sid], priority=PRI_TRANSCRIBE)
     return song
 
 
@@ -504,17 +512,17 @@ async def get_song_vocal_safe_regions(
     stems = db.scalar(select(Stems).where(Stems.song_id == song_id))
     lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_id))
     
-    if not transcription or not stems or not stems.vocal_envelope_path:
+    if not transcription or not stems or not stems.envelopes_path:
         raise HTTPException(status_code=409, detail="song not fully processed yet")
         
     storage = get_storage()
     try:
-        envelope_data = await storage.read(stems.vocal_envelope_path)
+        envelope_data = await storage.read(stems.envelopes_path)
         envelope = json.loads(envelope_data)
     except Exception as exc:
         logging.getLogger(__name__).exception(
             "vocal_safe_regions: failed to read envelope at %s",
-            stems.vocal_envelope_path,
+            stems.envelopes_path,
         )
         raise HTTPException(
             status_code=500,

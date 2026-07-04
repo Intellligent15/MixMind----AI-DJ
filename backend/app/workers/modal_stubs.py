@@ -28,12 +28,25 @@ import modal
 
 APP_NAME = "ai-dj-gpu-workers"
 
+# Essentia model files for tag_audio, baked into the image at build time
+# (~20 MB total). Embeddings come from Discogs-EffNet; two small
+# classification heads map those to genre and mood/theme labels. The
+# .json metadata files carry the class-label lists.
+ESSENTIA_MODELS_DIR = "/models"
+ESSENTIA_MODEL_URLS = (
+    "https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb",
+    "https://essentia.upf.edu/models/classification-heads/genre_discogs400/genre_discogs400-discogs-effnet-1.pb",
+    "https://essentia.upf.edu/models/classification-heads/genre_discogs400/genre_discogs400-discogs-effnet-1.json",
+    "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_moodtheme/mtg_jamendo_moodtheme-discogs-effnet-1.pb",
+    "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_moodtheme/mtg_jamendo_moodtheme-discogs-effnet-1.json",
+)
+
 # Image: slim Debian + Python 3.11, ffmpeg, ML libs, S3 client. boto3
 # (sync) is used inside the function — async aioboto3 brings no benefit
 # inside a one-shot Modal call.
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg")
+    .apt_install("ffmpeg", "wget")
     .pip_install(
         "demucs>=4.0.1",
         "openai-whisper>=20240930",
@@ -46,6 +59,13 @@ image = (
         # ImportError. Pinning here is simpler than capping torchaudio.
         "torchcodec",
         "boto3>=1.34",
+        "essentia-tensorflow",
+    )
+    .run_commands(
+        f"mkdir -p {ESSENTIA_MODELS_DIR} && "
+        + " && ".join(
+            f"wget -q -P {ESSENTIA_MODELS_DIR} {url}" for url in ESSENTIA_MODEL_URLS
+        )
     )
 )
 
@@ -151,16 +171,22 @@ def run_separation(
         names = model.sources  # ["drums", "bass", "other", "vocals"]
         stems = {name: sources[i].cpu().numpy().T for i, name in enumerate(names)}
 
-        # Vocal envelope: per-100ms RMS of the vocal stem (mean of channels).
+        # Per-stem envelopes: frame-wise RMS + peak at 10 Hz, same schema
+        # as the local path (services/stems/service.py::_compute_stem_envelopes).
+        frame_hz = 10
+        hop = sr // frame_hz
+        envelopes: dict = {"frame_hz": frame_hz}
+        for name, arr in stems.items():
+            mono = arr.mean(axis=1) if arr.ndim == 2 else arr
+            n_frames = len(mono) // hop
+            trimmed = mono[: n_frames * hop].reshape(n_frames, hop)
+            envelopes[name] = {
+                "rms": np.sqrt(np.mean(trimmed ** 2, axis=1)).tolist(),
+                "peak": np.abs(trimmed).max(axis=1).tolist(),
+            }
         vocals = stems["vocals"]
-        mono = vocals.mean(axis=1) if vocals.ndim == 2 else vocals
-        hop = int(sr * 0.1)
-        n_frames = max(1, len(mono) // hop)
-        env = [
-            float(np.sqrt(np.mean(mono[i * hop : (i + 1) * hop] ** 2)))
-            for i in range(n_frames)
-        ]
-        vocal_rms = float(np.sqrt(np.mean(mono ** 2)))
+        vocals_mono = vocals.mean(axis=1) if vocals.ndim == 2 else vocals
+        vocal_rms = float(np.sqrt(np.mean(vocals_mono ** 2)))
 
         keys: dict[str, str] = {}
         for name, arr in stems.items():
@@ -170,9 +196,9 @@ def run_separation(
             s3.upload_file(str(dest), s3_bucket, key)
             keys[name] = key
 
-        env_key = f"stems/{video_id}/vocal_envelope.json"
-        env_dest = td / "vocal_envelope.json"
-        env_dest.write_text(json.dumps({"hop_seconds": 0.1, "rms": env}))
+        env_key = f"stems/{video_id}/envelopes.json"
+        env_dest = td / "envelopes.json"
+        env_dest.write_text(json.dumps(envelopes))
         s3.upload_file(str(env_dest), s3_bucket, env_key)
 
     return {
@@ -180,7 +206,7 @@ def run_separation(
         "drums_path": keys["drums"],
         "bass_path": keys["bass"],
         "other_path": keys["other"],
-        "vocal_envelope_path": env_key,
+        "envelopes_path": env_key,
         "vocal_rms": vocal_rms,
         "model_name": model_name,
     }
@@ -273,3 +299,87 @@ def run_transcription(
         "model_name": "whisper-large-v3",
         "segments": segments,
     }
+
+
+# EffNet inference on a full track is a few seconds on CPU, and the
+# essentia-tensorflow wheel is CPU-only anyway — no GPU requested.
+@app.function(timeout=600)
+def tag_audio(
+    audio_key: str,
+    s3_endpoint: str,
+    s3_bucket: str,
+    s3_access: str,
+    s3_secret: str,
+    s3_region: str,
+) -> dict:
+    """Download audio, run Essentia Discogs-EffNet tagging, and return
+    ``{"genres": [...], "moods": [...]}`` (most-probable first)."""
+    import json
+    import os
+    import tempfile
+
+    from essentia.standard import (
+        MonoLoader,
+        TensorflowPredict2D,
+        TensorflowPredictEffnetDiscogs,
+    )
+
+    def _labels(metadata_file: str) -> list[str]:
+        path = os.path.join(ESSENTIA_MODELS_DIR, metadata_file)
+        with open(path) as f:
+            return json.load(f)["classes"]
+
+    def _top(probs, labels: list[str], k: int, threshold: float) -> list[tuple[str, float]]:
+        ranked = sorted(zip(labels, probs), key=lambda p: p[1], reverse=True)
+        return [(label, float(p)) for label, p in ranked[:k] if p >= threshold]
+
+    s3 = _make_s3_client(s3_endpoint, s3_bucket, s3_access, s3_secret, s3_region)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = os.path.join(tmpdir, "audio.wav")
+        s3.download_file(s3_bucket, audio_key, audio_path)
+
+        # EffNet models want 16 kHz mono input.
+        audio = MonoLoader(filename=audio_path, sampleRate=16000, resampleQuality=4)()
+        embeddings = TensorflowPredictEffnetDiscogs(
+            graphFilename=os.path.join(ESSENTIA_MODELS_DIR, "discogs-effnet-bs64-1.pb"),
+            output="PartitionedCall:1",
+        )(audio)
+
+        genre_probs = TensorflowPredict2D(
+            graphFilename=os.path.join(
+                ESSENTIA_MODELS_DIR, "genre_discogs400-discogs-effnet-1.pb"
+            ),
+            input="serving_default_model_Placeholder",
+            output="PartitionedCall:0",
+        )(embeddings).mean(axis=0)
+
+        mood_probs = TensorflowPredict2D(
+            graphFilename=os.path.join(
+                ESSENTIA_MODELS_DIR, "mtg_jamendo_moodtheme-discogs-effnet-1.pb"
+            ),
+            input="model/Placeholder",
+            output="model/Sigmoid",
+        )(embeddings).mean(axis=0)
+
+    # Discogs400 labels are "Parent---Subgenre"; keep both, most-probable
+    # first, deduped (several subgenres share a parent).
+    genres: list[str] = []
+    for label, _ in _top(genre_probs, _labels("genre_discogs400-discogs-effnet-1.json"), k=5, threshold=0.1):
+        for part in label.split("---"):
+            part = part.strip().lower()
+            if part and part not in genres:
+                genres.append(part)
+
+    # Mood/theme is multi-label with characteristically low sigmoid
+    # activations — a lower threshold than genre is intentional.
+    moods = [
+        label.lower()
+        for label, _ in _top(
+            mood_probs,
+            _labels("mtg_jamendo_moodtheme-discogs-effnet-1.json"),
+            k=5,
+            threshold=0.05,
+        )
+    ]
+
+    return {"genres": genres, "moods": moods}

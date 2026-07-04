@@ -9,7 +9,7 @@ from app.core.db import SessionLocal
 from app.models import Analysis, Song, SongStatus
 from app.services.analysis.service import AnalysisService
 from app.services.storage import get_storage
-from app.workers import PRI_SEPARATE, celery_app
+from app.workers import PRI_SEPARATE, PRI_TAG, celery_app
 from app.workers.separate import separate_stems
 
 logger = logging.getLogger(__name__)
@@ -113,5 +113,8 @@ def analyze_song(song_id: str) -> str | None:
 
     if wants_pipeline:
         separate_stems.apply_async(args=[str(song_uuid)], priority=PRI_SEPARATE)
+        # tag_audio only needs the Analysis row and the original audio,
+        # so it runs in parallel with separation.
+        celery_app.send_task("tag_audio", args=[str(song_uuid)], priority=PRI_TAG)
 
     return str(song_uuid)

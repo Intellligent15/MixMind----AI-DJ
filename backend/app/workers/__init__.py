@@ -11,6 +11,7 @@ PRI_DOWNLOAD = 0
 PRI_ANALYZE = 3
 PRI_SEPARATE = 6
 PRI_TRANSCRIBE = 9
+PRI_TAG = 6
 
 celery_app = Celery(
     "ai_dj",
@@ -22,6 +23,7 @@ celery_app = Celery(
         "app.workers.analyze",
         "app.workers.separate",
         "app.workers.transcribe",
+        "app.workers.tagging",
         "app.workers.plan_set",
         "app.workers.render_transition",
         "app.workers.stitch_queue",

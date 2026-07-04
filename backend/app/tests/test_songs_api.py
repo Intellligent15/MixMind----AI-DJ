@@ -134,7 +134,7 @@ def test_list_songs_includes_has_stems_has_transcription(db_session: Session):
             model_name="htdemucs",
             status=StemsStatus.separated,
             vocals_path="x", drums_path="x", bass_path="x", other_path="x",
-            vocal_envelope_path=None, vocal_rms=0.1,
+            envelopes_path=None, vocal_rms=0.1,
         )
     )
     db_session.flush()
